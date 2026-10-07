@@ -147,7 +147,21 @@ function renderTrend() {
   const peak=buckets.reduce((n,b)=>Math.max(n,bucketValue(b)),metric==="credits"?.01:1);
   const magnitude=10**Math.floor(Math.log10(Math.max(metric==="credits"?.0025:1,peak/4)));
   const tick=[1,2,5,10].map(n=>n*magnitude).find(n=>n>=peak/4), max=tick*4;
-  const top=26,height=142,left=52,width=540,step=width/buckets.length;
+  const height=142,left=52,width=540,step=width/buckets.length;
+  // Show every non-zero bucket. Move crowded labels upward instead of sampling
+  // every third bar; reserve enough headroom so peak labels remain inside the SVG.
+  const placed=[];
+  const labels=buckets.map((b,i)=>{
+    const value=bucketValue(b);
+    if(value<=0)return null;
+    const text=compact(value),x=left+(i+.5)*step,baseY=26+height*(1-value/max)-5;
+    // Labels use a 10px monospace font (about 6px per character), plus a gutter.
+    const label={text,x,width:text.length*6+6,y:baseY,baseY};
+    while(placed.some(other=>Math.abs(other.x-x)<(other.width+label.width)/2&&Math.abs(other.y-label.y)<13))label.y-=14;
+    placed.push(label);
+    return label;
+  });
+  const labelShift=Math.max(0,...placed.map(label=>27-label.y)),top=26+labelShift;
   const clock=t=>new Date(t).toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit",hour12:false});
   const date=t=>new Date(t).toLocaleDateString("zh-CN",{month:"2-digit",day:"2-digit",...(new Date(from).getFullYear()!==new Date(to).getFullYear()?{year:"numeric"}:{})});
   const stamp=t=>new Date(t).toLocaleString("zh-CN",{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
@@ -161,12 +175,16 @@ function renderTrend() {
     content+='<g tabindex="0" role="img" aria-label="'+esc(detail)+'" data-chart-detail="'+esc(detail)+'">';
     const series=metric==="requests"?[["success","#329a74"],["failed","#ce5668"],["unknown","#8795a2"]]:[[metric,metric==="credits"?"#b48532":"#328cad"]];
     for(const [key,color] of series){const h=Math.max(0,b[key]/max*height);y-=h;content+='<rect x="'+(left+i*step+3)+'" y="'+y+'" width="'+(step-6)+'" height="'+h+'" rx="2" fill="'+color+'"/>';}
-    if(bucketValue(b)>0&&i%Math.ceil(buckets.length/8)===0)content+='<text class="bar-count" x="'+(left+(i+.5)*step)+'" y="'+(y-5)+'" text-anchor="middle" fill="#42594f" font-size="10">'+compact(bucketValue(b))+'</text>';
+    const label=labels[i];
+    if(label){
+      if(label.y<label.baseY)content+='<line x1="'+label.x+'" x2="'+label.x+'" y1="'+(label.y+labelShift+3)+'" y2="'+(y-2)+'" stroke="#bdcec5" stroke-width=".7"/>';
+      content+='<text class="bar-count" x="'+label.x+'" y="'+(label.y+labelShift)+'" text-anchor="middle" fill="#42594f" font-family="ui-monospace,monospace" font-size="10">'+label.text+'</text>';
+    }
     content+='<rect class="chart-hit" x="'+(left+i*step)+'" y="'+top+'" width="'+step+'" height="'+height+'" fill="transparent"/></g>';
   });
   const longRange=to-from>48*3600000;
-  content+=[0,.25,.5,.75,1].map(f=>{const x=left+width*f,t=from+(to-from)*f,anchor=f===0?'start':f===1?'end':'middle';return '<text x="'+x+'" y="191" text-anchor="'+anchor+'" fill="#53685e" font-size="12">'+(longRange?date(t):clock(t))+'</text>'+(longRange?'':'<text x="'+x+'" y="209" text-anchor="'+anchor+'" fill="#74857c" font-size="11">'+date(t)+'</text>');}).join("");
-  $("trendChart").innerHTML='<svg viewBox="0 0 616 222" role="group" aria-label="'+esc(metricLabel+'趋势：'+usageCount(amount)+' '+unit)+'">'+content+'</svg>';
+  content+=[0,.25,.5,.75,1].map(f=>{const x=left+width*f,t=from+(to-from)*f,anchor=f===0?'start':f===1?'end':'middle';return '<text x="'+x+'" y="'+(191+labelShift)+'" text-anchor="'+anchor+'" fill="#53685e" font-size="12">'+(longRange?date(t):clock(t))+'</text>'+(longRange?'':'<text x="'+x+'" y="'+(209+labelShift)+'" text-anchor="'+anchor+'" fill="#74857c" font-size="11">'+date(t)+'</text>');}).join("");
+  $("trendChart").innerHTML='<svg viewBox="0 0 616 '+(222+labelShift)+'" role="group" aria-label="'+esc(metricLabel+'趋势：'+usageCount(amount)+' '+unit)+'">'+content+'</svg>';
 }
 function renderCreditsCoverage(unknown) {
   $("chartCoverage").hidden=ui.metric!=="credits" || !unknown;
