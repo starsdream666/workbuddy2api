@@ -39,6 +39,8 @@ type Router struct {
 	entries map[string]entry
 	cfg     Config
 	stop    chan struct{}
+	gcDone  chan struct{}
+	gcWake  chan struct{}
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -64,15 +66,25 @@ func (r *Router) StartGC() {
 		return
 	}
 	r.stop = make(chan struct{})
+	r.gcDone = make(chan struct{})
+	r.gcWake = make(chan struct{}, 1)
+	stop, done, wake := r.stop, r.gcDone, r.gcWake
+	interval := r.cfg.GCInterval
 	r.mu.Unlock()
 
 	go func() {
-		t := time.NewTicker(r.cfg.GCInterval)
+		defer close(done)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
-			case <-r.stop:
+			case <-stop:
 				return
+			case <-wake:
+				r.mu.RLock()
+				interval = r.cfg.GCInterval
+				r.mu.RUnlock()
+				t.Reset(interval)
 			case <-t.C:
 				r.gcOnce(time.Now())
 			}
@@ -83,10 +95,27 @@ func (r *Router) StartGC() {
 // StopGC 停止后台 GC（幂等）。
 func (r *Router) StopGC() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	done := r.gcDone
 	if r.stop != nil {
 		close(r.stop)
 		r.stop = nil
+	}
+	r.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+// ApplyRuntime preserves bindings and wakes the existing GC loop.
+func (r *Router) ApplyRuntime(ttl, interval time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cfg.TTL, r.cfg.GCInterval = ttl, interval
+	if r.gcWake != nil {
+		select {
+		case r.gcWake <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -122,8 +151,9 @@ func (r *Router) Resolve(key string) (string, bool) {
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
 	e, found := r.entries[key]
+	ttl := r.cfg.TTL
 	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) {
+	if found && !expired(e, now, ttl) {
 		if available[e.uid] {
 			r.touch(key, e.uid, now)
 			return e.uid, true
@@ -179,8 +209,9 @@ func (r *Router) Resolve(key string) (string, bool) {
 func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
+	ttl := r.cfg.TTL
 	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.cfg.Store.SetBind(key, uid, ttl)
 }
 
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
@@ -193,8 +224,9 @@ func (r *Router) Bind(key, uid string) {
 	now := time.Now()
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
+	ttl := r.cfg.TTL
 	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.cfg.Store.SetBind(key, uid, ttl)
 }
 
 // Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。

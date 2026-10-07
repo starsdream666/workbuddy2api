@@ -1,10 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"workbuddy2api/internal/config"
+	"workbuddy2api/internal/realm"
 )
 
 func TestDefault(t *testing.T) {
@@ -549,17 +554,18 @@ func TestMaxBodyEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptDefaultCustom 默认 prompt.mode=custom 且 PromptText 为内置默认（非空）。
-func TestPromptDefaultCustom(t *testing.T) {
+// TestPromptDefaultPassthrough 默认 prompt.mode=passthrough，且**不加载任何提示词文本**
+// （网关不内置提示词：PromptText 必须为空，出站 body 原样透传）。
+func TestPromptDefaultPassthrough(t *testing.T) {
 	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("prompt.mode=%q want custom", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
 	}
-	if c.PromptText == "" {
-		t.Error("PromptText should be non-empty (built-in default)")
+	if c.PromptText != "" {
+		t.Errorf("PromptText=%q want 空（网关不内置提示词）", c.PromptText)
 	}
 }
 
@@ -607,7 +613,13 @@ func TestPromptFileOverride(t *testing.T) {
 	want := "我的自定义人格入口"
 	os.WriteFile(pf, []byte(want), 0o600)
 	cf := filepath.Join(dir, "c.json")
-	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+pf+`"}}`), 0o600)
+	// 用 json.Marshal 拼配置：Windows 路径含反斜杠，手写拼接会产生非法 JSON 转义
+	// （既有缺陷，仅 Windows 触发；与本次 realm 改造无关）。
+	raw, err := json.Marshal(map[string]any{"prompt": map[string]any{"mode": "custom", "file": pf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(cf, raw, 0o600)
 	c, err := Load(cf)
 	if err != nil {
 		t.Fatal(err)
@@ -629,7 +641,8 @@ func TestPromptEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 仍 custom。
+// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：
+// mode 缺省 passthrough 且不加载任何提示词文本（网关不内置提示词）。
 func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -638,8 +651,11 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("legacy config should default to custom, got %q", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("legacy config should default to passthrough, got %q", c.Prompt.Mode)
+	}
+	if c.PromptText != "" {
+		t.Errorf("PromptText=%q want 空（不注入任何提示词）", c.PromptText)
 	}
 	if c.Listen != ":9999" {
 		t.Errorf("listen=%q", c.Listen)
@@ -672,5 +688,128 @@ func TestUpstreamUserAgentConfig(t *testing.T) {
 	}
 	if c3.Upstream.UserAgent != "EnvAgent/9" {
 		t.Errorf("env user_agent=%q want EnvAgent/9", c3.Upstream.UserAgent)
+	}
+}
+
+// TestUsageLogCalibrateIntervalConfig 单号校准间隔的配置解析与默认值。
+//
+// 这是"本地即时扣减 + 单号校准"的节流旋钮：
+//   - 未配置 → 默认 5m（本地扣减已足够准，校准只作防漂移保险丝）
+//   - 显式值 → 按解析结果生效（"1ns" 表示每次都校准）
+//   - 非法值 → 报错而非静默回落（配置笔误不该被吞掉）
+func TestUsageLogCalibrateIntervalConfig(t *testing.T) {
+	// 未配置 → 默认 5m。
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CalibrateDur != 5*time.Minute {
+		t.Errorf("default calibrate=%v want 5m", c.CalibrateDur)
+	}
+
+	// 文件显式值。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"usage_log":{"calibrate_interval":"90s"}}`), 0o600)
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.CalibrateDur != 90*time.Second {
+		t.Errorf("file calibrate=%v want 90s", c2.CalibrateDur)
+	}
+
+	// 极小值 = 每次请求都校准（合法表达，不能被当"未配置"吞掉）。
+	fp2 := filepath.Join(dir, "c2.json")
+	os.WriteFile(fp2, []byte(`{"usage_log":{"calibrate_interval":"1ns"}}`), 0o600)
+	c3, err := Load(fp2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.CalibrateDur != time.Nanosecond {
+		t.Errorf("tiny calibrate=%v want 1ns (must not fall back to default)", c3.CalibrateDur)
+	}
+
+	// env 覆盖文件。
+	t.Setenv("WB2A_USAGE_LOG_CALIBRATE_INTERVAL", "3m")
+	c4, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c4.CalibrateDur != 3*time.Minute {
+		t.Errorf("env calibrate=%v want 3m", c4.CalibrateDur)
+	}
+
+	// 非法时长 → 明确报错。
+	fp3 := filepath.Join(dir, "c3.json")
+	os.WriteFile(fp3, []byte(`{"usage_log":{"calibrate_interval":"nonsense"}}`), 0o600)
+	t.Setenv("WB2A_USAGE_LOG_CALIBRATE_INTERVAL", "")
+	if _, err := Load(fp3); err == nil {
+		t.Error("bad calibrate_interval must be rejected, not silently defaulted")
+	}
+}
+
+// TestLoadLegacyAIRealmKeys realm 改名（ai → workbuddy）的兼容：旧配置里的 "ai" 键必须被归一成
+// "workbuddy"，旧状态文件名（state-ai.json）仍被识别为历史文件。
+// 这是"老部署升级后零改动继续跑"的关键路径 —— realms / realm_overrides / realm_tasks /
+// model_prefixes 四处都可能写着 ai，所以固定下来防漂移。
+func TestLoadLegacyAIRealmKeys(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "config.json")
+	raw := `{
+  "api_key": "sk-cn",
+  "state_file": "state.json",
+  "upstream": {
+    "realm": "ai",
+    "realm_overrides": { "ai": { "fingerprint": "workbuddy-desktop", "client_version": "5.5.2" } }
+  },
+  "realms": { "ai": { "api_key": "sk-ai" } },
+  "model_prefixes": { "workbuddy": "ai" },
+  "schedule": { "realm_tasks": { "ai": { "checkin": false } } }
+}`
+	if err := os.WriteFile(fp, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("旧名 ai 的配置必须还能加载: %v", err)
+	}
+	if c.Upstream.Realm != realm.WB {
+		t.Errorf("upstream.realm=%q want %q", c.Upstream.Realm, realm.WB)
+	}
+	if got := c.RealmAPIKey(realm.WB); got != "sk-ai" {
+		t.Errorf("realms.ai 未归一: RealmAPIKey(workbuddy)=%q want sk-ai", got)
+	}
+	if got := c.RealmAPIKey(realm.AI); got != "sk-ai" {
+		t.Errorf("按旧名查询也要命中: RealmAPIKey(ai)=%q want sk-ai", got)
+	}
+	if _, ok := c.Realms["ai"]; ok {
+		t.Error("Realms 只该保留归一名 workbuddy")
+	}
+	if got := c.RealmFingerprint(realm.WB); got != realm.FingerprintDesktop {
+		t.Errorf("realm_overrides.ai 未归一: fingerprint=%q want %q", got, realm.FingerprintDesktop)
+	}
+	if got := c.RealmClientVersion(realm.AI); got != "5.5.2" {
+		t.Errorf("client_version=%q want 5.5.2", got)
+	}
+	if got := c.ModelPrefixes["workbuddy"]; got != realm.WB {
+		t.Errorf("model_prefixes.workbuddy=%q want %q", got, realm.WB)
+	}
+	if c.Schedule.RealmTaskEnabled(realm.WB, config.TaskCheckin) {
+		t.Error("realm_tasks.ai 的显式 false 未生效（键没归一）")
+	}
+	if !c.Schedule.RealmTaskEnabled(realm.WB, config.TaskKeepalive) {
+		t.Error("未列出的任务应继续继承 = true")
+	}
+	// 默认线（这里被 upstream.realm=ai 归一成 workbuddy）用基础状态文件，其余派生；
+	// 旧名 state-ai.json 仍被识别为历史文件（首次启动迁移用）。
+	if got := c.StateFileFor(realm.WB); got != "state.json" {
+		t.Errorf("StateFileFor(workbuddy)=%q want state.json（它就是默认线）", got)
+	}
+	if got := c.StateFileFor(realm.CN); got != "state-cn.json" {
+		t.Errorf("StateFileFor(cn)=%q want state-cn.json", got)
+	}
+	if got := c.LegacyStateFileFor(realm.WB); got != "state-ai.json" {
+		t.Errorf("LegacyStateFileFor(workbuddy)=%q want state-ai.json", got)
 	}
 }

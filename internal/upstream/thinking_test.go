@@ -270,12 +270,12 @@ func TestInjectThinkingSkipNonDeepSeek(t *testing.T) {
 					t.Errorf("thinking 被改动: in=%s out=%s", inJSON, outJSON)
 				}
 			}
-			// 非 deepseek 不得新增其他字段（除强制 stream 这一既有行为）。
-			if len(got) != len(in)+1 {
-				for k := range got {
-					if _, had := in[k]; !had {
-						t.Errorf("非 deepseek 新增字段 %q (out=%s)", k, out)
-					}
+			for key := range got {
+				if key == "stream" || key == "stream_options" {
+					continue
+				}
+				if _, had := in[key]; !had {
+					t.Errorf("非 deepseek 新增字段 %q (out=%s)", key, out)
 				}
 			}
 		})

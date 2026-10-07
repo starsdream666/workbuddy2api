@@ -6,13 +6,14 @@ import (
 )
 
 // degradeGate 降级状态机：passthrough 模式下请求被上游内容策略拦截时，
-// 切换到 Degraded 中性提示词直到次日 00:00 CST 重置。
+// 进入降级直到次日 00:00 CST 重置。
 //
 // 定位：误报处理（与 internal/upstream/sanitize.go 同哲学）——内容拦截多为
-// system 来源的指纹误报，换最小中性提示词即可绕开；不是对抗框架。
+// system 来源的指纹误报。本网关**不注入任何自有提示词**，降级动作只是把
+// system/developer 消息**剥离**（prompt.StripSystem），不做替换。
 //
 // 状态机：进程内存、重启清零（可接受：重启极少触发，且 custom 模式根本
-// 不进降级路径）。降级期内的请求直达 Degraded，不再先撞 400。
+// 不进降级路径）。降级期内的请求直达剥离子集，不再先撞 400。
 type degradeGate struct {
 	mu    sync.Mutex
 	until time.Time

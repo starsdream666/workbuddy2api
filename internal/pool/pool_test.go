@@ -243,6 +243,20 @@ func TestPickDeterministicViaSetRandomSource(t *testing.T) {
 	}
 }
 
+func TestPickLRUTimestampTies(t *testing.T) {
+	p := New("")
+	stamp := time.Now().Add(time.Minute)
+	for _, uid := range []string{"a", "b", "newer"} {
+		p.Add(&auth.Auth{UID: uid})
+		p.byUID[uid].lastUsed = stamp
+	}
+	p.byUID["newer"].lastUsed = stamp.Add(time.Minute)
+	p.SetRandomSource(func(n int64) int64 { return n - 1 })
+	if got := p.Pick(); got == nil || got.UID != "b" {
+		t.Fatalf("LRU timestamp ties must use random selection among oldest accounts: %+v", got)
+	}
+}
+
 func TestPickAntiThunderingHerd(t *testing.T) {
 	// 100 goroutine 同时 Pick：防并发撞号窗口内同一账号不应被重复选中。
 	// credits 相同 → 无注入源时加权随机应天然打散；为保证稳定，全部置 0 走均匀随机。
@@ -353,14 +367,22 @@ func TestReenableIfCredits(t *testing.T) {
 	}
 }
 
-func TestReenableZeroCreditsKeepsCooling(t *testing.T) {
+// TestReenableZeroCreditsFreezes 签到/余额查询观测到余额为 0 → 冻结账号
+// （旧语义是"保持时间冷却"；冻结后由额度巡检在余额恢复时解冻）。
+func TestReenableZeroCreditsFreezes(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.ReenableIfCredits("u1", 0)
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatal("zero credits should stay cooling")
+	if !st.Frozen {
+		t.Fatalf("余额为 0 应冻结: %+v", st)
+	}
+	if st.Cooling {
+		t.Error("冻结应取代时间冷却（否则会到点自动解冻，余额仍是 0）")
+	}
+	if p.Pick() != nil {
+		t.Error("冻结账号不该被选中")
 	}
 }
 
@@ -976,7 +998,7 @@ func TestSoftRateModelNotPersistedToState(t *testing.T) {
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftForModel("u1", time.Minute, time.Now(), "glm-5.3", "429 rate limit")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Minute), "glm-5.3", "429 rate limit")
 	p.Flush()
 	raw, err := os.ReadFile(fp)
 	if err != nil {

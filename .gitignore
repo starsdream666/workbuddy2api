@@ -3,6 +3,10 @@ auths/
 data/
 *.key
 *.pem
+*.setup-token
+access.json.lock
+Temp/.gomod/
+Temp/.gopath/
 *.env
 .env
 .env.*
@@ -19,9 +23,17 @@ config.json
 # Build artifacts
 *.tmp
 __pycache__/
+/Temp/
 
 # Backups (contains auth tokens)
 backups/
+# 凭证导出 / 账号切换脚本产物（含真实 access_token）
+wb-switch-accounts-*.json
+*.info
+reasonix.toml
+.reasonix/
+outputs/
+scripts/console_test.cjs
 
 # IDE
 .idea/
@@ -34,3 +46,12 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+!MIGRATION.md
+# Optional writable deployment config contains private credentials.
+/settings/
+
+# Keep execution plans; other local docs remain ignored.
+!/docs/
+/docs/*
+!/docs/hot-reload-plan.md
+!/docs/settings-layout-plan.md

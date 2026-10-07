@@ -22,10 +22,11 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(src, &obj); err != nil {
+	if err := json.Unmarshal(src, &obj); err != nil || obj == nil {
 		return src
 	}
 	obj["stream"] = true
+	normalizeRequestCompatibility(obj)
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
@@ -195,4 +196,57 @@ func normalizeToolChoice(obj map[string]any) {
 	default:
 		delete(obj, "tool_choice")
 	}
+}
+
+// leadingSystemFallback 首条 system 缺失时补的 role 占位：**空内容，不带任何文案**。
+// 上游只校验首条消息的 role，不看内容（实测 2026-09-30：content 为空串照样 200；
+// 首条非 system / system 不在首位则 400 code=11128 "first message is not system prompt"）。
+// 所以网关不必为了满足契约而编造提示词。
+
+const leadingSystemFallback = ""
+
+// EnsureLeadingSystem 确保 messages 首条是 system 角色。
+//
+// WorkBuddy AI 线（www.workbuddy.ai）对首条消息做硬校验：非 system 直接
+// HTTP 400 code=11128 "first message is not system prompt"（CN 线不校验）。
+// 缺省 passthrough 原样透传客户端消息，客户端未带 system 时就会撞 11128 —— 此处
+// 在出站前补一条**空 system**（role 满足契约、content 为空、不注入任何文案），
+// 让「网关零提示词注入」与「上游硬校验」同时成立。
+//
+// 已有 system/developer 首条（normalizeRoles 已把 developer 归一为 system）时原样返回；
+// body 非 JSON / 无 messages / messages 非数组一律原样返回（不猜客户端意图）。
+func EnsureLeadingSystem(src []byte) []byte {
+	if len(src) == 0 {
+		return src
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(src, &obj); err != nil {
+		return src
+	}
+	raw, present := obj["messages"]
+	if !present {
+		return src
+	}
+	msgs, ok := raw.([]any)
+	if !ok {
+		return src
+	}
+	if len(msgs) > 0 {
+		if first, ok := msgs[0].(map[string]any); ok {
+			if role, _ := first["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
+				return src
+			}
+		}
+	}
+	lead := map[string]any{"role": "system", "content": leadingSystemFallback}
+	out := make([]any, 0, len(msgs)+1)
+	out = append(out, lead)
+	out = append(out, msgs...)
+	obj["messages"] = out
+	rewritten, err := json.Marshal(obj)
+	if err != nil {
+		return src
+	}
+	log.Printf("WARN: [upstream] leading system prompt injected (upstream requires first message to be system)")
+	return rewritten
 }

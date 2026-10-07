@@ -23,12 +23,20 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"workbuddy2api/internal/realm"
 )
 
-const billingBaseCN = "https://www.codebuddy.cn"
+// billingBase 返回该账号所属产品线的 billing base（realm 缺省 = cn，与改造前一致）。
+// 两条线的 billing 域不同：cn → www.codebuddy.cn，ai → www.workbuddy.ai。
+func billingBase(rn string) string {
+	return realm.Defaults()[realm.Normalize(rn)].BillingBase
+}
 
 type authFile struct {
-	Auth struct {
+	// Realm 上游产品线（"cn" / "ai"）；缺省 = cn（旧 auth 文件零改动）。
+	Realm string `json:"realm"`
+	Auth  struct {
 		AccessToken string `json:"accessToken"`
 		Domain      string `json:"domain"`
 	} `json:"auth"`
@@ -98,7 +106,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	})
-	req, err := http.NewRequest(http.MethodPost, billingBaseCN+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, billingBase(af.Realm)+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}

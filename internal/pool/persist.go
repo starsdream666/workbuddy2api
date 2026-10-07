@@ -56,7 +56,7 @@ func (p *Pool) RestoreFromSnapshot() {
 		p.mu.Lock()
 		p.applySnapshotLocked(snap)
 		p.mu.Unlock()
-		p.dirty.Store(true)
+		p.markDirty()
 		log.Printf("[pool] 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
 		return
 	}
@@ -113,17 +113,31 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		p.byUID[uid] = &entry{
-			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:      s.Credits,
-			disabled:     s.Disabled,
-			reason:       s.Reason,
-			until:        s.Until,
-			coolKind:     s.CoolKind,
-			successCount: s.SuccessCount,
-			errTotal:     errTotal,
-			lastErr:      s.LastErr,
-			lastSuccess:  s.LastSuccess,
-			softStreak:   s.SoftStreak,
+			a:       &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits: s.Credits,
+			// 旧 state.json 无 credits_known 字段：余额为正只可能是被观测过的
+			// （初始值恒 0），据此推断，避免升级后一次刷新前所有账号都报"未知"。
+			creditsKnown:   s.CreditsKnown || s.Credits > 0,
+			disabled:       s.Disabled,
+			reason:         s.Reason,
+			manualDisabled: s.ManualDisabled,
+			manualReason:   s.ManualReason,
+			until:          s.Until,
+			coolKind:       s.CoolKind,
+			successCount:   s.SuccessCount,
+			errTotal:       errTotal,
+			lastErr:        s.LastErr,
+			lastSuccess:    s.LastSuccess,
+			softStreak:     s.SoftStreak,
+			frozen:         s.CreditFrozen,
+			frozenReason:   s.CreditFrozenReason,
+			frozenUntil:    s.CreditFrozenUntil,
+			// 选号配置随 state.json 往返（缺字段 → 零值，行为与改造前一致）。
+			// 落位直接落库不归一：normalizePlacement 已在写入端（SetAccountSelection）
+			// 做过一次，这里再归一只是冗余；而 selectionTierOf 对未知值本就兜底。
+			selExcluded:  s.SelectionExcluded,
+			selPlacement: s.SelectionPlacement,
+			selPriority:  s.SelectionPriority,
 		}
 	}
 }
@@ -188,16 +202,27 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = stateAccount{
-			Credits:      e.credits,
-			Disabled:     e.disabled,
-			Reason:       e.reason,
-			Until:        e.until,
-			CoolKind:     e.coolKind,
-			SuccessCount: e.successCount,
-			ErrTotal:     e.errTotal,
-			LastSuccess:  e.lastSuccess,
-			LastErr:      e.lastErr,
-			SoftStreak:   e.softStreak,
+			Credits:        e.credits,
+			CreditsKnown:   e.creditsKnown,
+			Disabled:       e.disabled,
+			Reason:         e.reason,
+			ManualDisabled: e.manualDisabled,
+			ManualReason:   e.manualReason,
+			Until:          e.until,
+			CoolKind:       e.coolKind,
+			SuccessCount:   e.successCount,
+			ErrTotal:       e.errTotal,
+			LastSuccess:    e.lastSuccess,
+			LastErr:        e.lastErr,
+			SoftStreak:     e.softStreak,
+
+			CreditFrozen:       e.frozen,
+			CreditFrozenReason: e.frozenReason,
+			CreditFrozenUntil:  e.frozenUntil,
+
+			SelectionExcluded:  e.selExcluded,
+			SelectionPlacement: e.selPlacement,
+			SelectionPriority:  e.selPriority,
 		}
 	}
 	return sf

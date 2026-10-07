@@ -16,3 +16,21 @@ PLAN.md
 SPEC.md
 LOOP.md
 README.md
+# 本地开发状态、浏览器测试产物与私密环境配置不进入构建上下文
+.workbuddy-ai/
+.reasonix/
+.playwright-cli/
+outputs/
+node_modules/
+.env
+.env.*
+*.log
+*.exe
+# 凭证导出 / 切换脚本产物（含真实 access_token，绝不进构建上下文）
+wb-switch-accounts-*.json
+*.info
+reasonix.toml
+scripts/console_test.cjs
+
+# 本地工作区垃圾（大体积 CLI 包 / 备份 / 探针脚本 / 报告）不进构建上下文
+Temp/

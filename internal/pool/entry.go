@@ -27,17 +27,40 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID             string    `json:"uid"`
-	Nickname        string    `json:"nickname,omitempty"`
-	Credits         int64     `json:"credits"`
-	Cooling         bool      `json:"cooling"`
-	CoolKind        string    `json:"cool_kind,omitempty"`
-	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
-	Until           time.Time `json:"until,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
-	SoftStreak      int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
-	Disabled        bool      `json:"disabled"`
-	DisabledReason  string    `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	// CreditsExact 含小数扣减的**真实可用额度** = credits - creditFrac。
+	//
+	// 为什么需要这个独立字段：credits 是整数余额，而本地即时扣减会把小数消耗
+	// （如 10.85）攒在 creditFrac 里、满 1 才落到 credits 上（见 deduct.go 的精度说明）。
+	// 于是"还剩多少"的真实值是二者相减——只报 credits 会**多报**最多 1 分。
+	// 上游余额本身只有整数，这个小数完全来自本地扣减，故仅在 creditsKnown 时有意义。
+	CreditsExact float64 `json:"credits_exact"`
+	// CreditsKnown 余额是否被上游真实观测过。false 时 Credits 的 0 表示"未知"
+	// 而非"已耗尽"——调用日志做"消耗 = 调用前 - 调用后"差值时必须据此区分。
+	CreditsKnown   bool      `json:"credits_known"`
+	Cooling        bool      `json:"cooling"`
+	CoolKind       string    `json:"cool_kind,omitempty"`
+	CoolRemaining  int64     `json:"cool_remaining_sec,omitempty"`
+	Until          time.Time `json:"until,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	SoftStreak     int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	Disabled       bool      `json:"disabled"`
+	DisabledReason string    `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// ManualDisabled 人工停用（控制台开关，持久化）。与 Disabled 正交：前者是运维主动停用，
+	// 后者是系统判定（12153 连续失败）。两者可同时为真，任一为真即不参与选号。
+	ManualDisabled bool   `json:"manual_disabled"`
+	ManualReason   string `json:"manual_reason,omitempty"` // 仅手动停用账号：停用原因（运维可见）
+	// SelectionExcluded / SelectionPlacement / SelectionPriority 账号级选号配置
+	// （控制台展示与编辑用；语义见 selection_account.go 与 pick.go 的分组口径）。
+	SelectionExcluded  bool   `json:"selection_excluded"`
+	SelectionPlacement string `json:"selection_placement,omitempty"`
+	SelectionPriority  int    `json:"selection_priority"`
+	// Frozen 额度冻结：上游余额为 0 时冻结，**直到额度探测确认恢复才解冻**。
+	// 与 disabled（session 死，需人工重登）语义不同——冻结是自动可逆的。
+	Frozen          bool      `json:"frozen,omitempty"`
+	FrozenReason    string    `json:"frozen_reason,omitempty"`
 	SuccessCount    int64     `json:"success_count,omitempty"`
 	ErrTotal        int64     `json:"err_total,omitempty"`
 	LastSuccessTime time.Time `json:"last_success,omitempty"`
@@ -48,8 +71,21 @@ type Status struct {
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 }
 type entry struct {
-	a            *auth.Auth
-	credits      int64
+	a       *auth.Auth
+	credits int64
+	// creditsKnown 该账号余额是否被上游真实观测过（SetCredits / ReconcileCredits /
+	// ReenableIfCredits 任一写入即置真）。未观测时 credits 的 0 是"未知"而非"耗尽"，
+	// 做"本次消耗 = 调用前余额 - 调用后余额"差值计算时必须区分，
+	// 否则会把"0 → 3"这种从未观测过的账号算成 -3 的消耗。
+	creditsKnown bool
+	// creditFrac 本地扣减累积的小数部分（< 1）。
+	// 上游消耗是小数（如 10.85）而 credits 是整数，靠它满 1 进位，避免长期丢精度。
+	// 运行态语义（不持久化）：重启后按最近一次权威余额重建，误差无累积意义。
+	creditFrac float64
+	// lastCalib 最近一次"单号额度校准"的时刻（见 CalibrateDue）。
+	// 运行态语义（不持久化）：重启后首个请求即重新校准，无需跨重启记忆。
+	lastCalib    time.Time
+	modelCharges map[string]modelPrice
 	successCount int64     // 累计成功
 	errTotal     int64     // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
 	lastErr      time.Time // 最近一次错误时间
@@ -58,7 +94,32 @@ type entry struct {
 	until        time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
 	disabled     bool
 	reason       string
-	lastUsed     time.Time // 最近被选中时刻（防并发撞号）
+	// manualDisabled 控制台人工停用（持久化）：停用有两层，与系统判定正交。
+	//   - disabled：系统层，由连续 12153（NoteSessionDead）/ refresh 失败写入；
+	//   - manualDisabled：人工层，只由控制台启停接口（SetManualDisabled）写入。
+	// healthy() 认为任一生效即不可选；人工启用只摘本层，不复活被系统判死的号——
+	// 系统层的清除仍只有重新登录与 ReviveDisabled 两条路径。
+	manualDisabled bool
+	manualReason   string
+	// ── 选号策略的按账号配置（控制台写入，随 state.json 持久化）──
+	//
+	// selExcluded 把该账号从选号策略的**常规分组**里移出：它不再与其余账号竞争，
+	// 而是按 selPlacement 落位到「优先组」或「兜底组」（分组口径见 pick.go）。
+	selExcluded bool
+	// selPlacement 排除后的落位：PlacementFirst（最优先使用）/ PlacementLast（最后使用）。
+	// 仅在 selExcluded 为真时有意义；空值按 PlacementLast 解释（见 selectionTierOf）。
+	selPlacement string
+	// selPriority 自定义优先级（仅 SelectionCustomPriority 策略使用）：数值大者优先。
+	selPriority int
+	// frozen 额度冻结（余额耗尽）：与 until 正交——until 是"时间到了就解冻"，
+	// frozen 是"必须探测到额度恢复才解冻"。没有这一层时，余额耗尽的账号在软冷却
+	// 到期后会被反复选中、反复撞 429（白刷上游，还把成功率权重拖低）。
+	frozen       bool
+	frozenReason string
+	// frozenUntil 冻结兜底截止：到期后即使探测没确认恢复也放行一次，避免探测任务
+	// 被关闭/上游接口长期异常时账号被永久冻结（宁可试一次撞 429，也不要静默失效）。
+	frozenUntil time.Time
+	lastUsed    time.Time // 最近被选中时刻（防并发撞号）
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。
@@ -83,9 +144,15 @@ type entry struct {
 	inFlight atomic.Int64
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
+// healthy 报告账号当前是否可选（未被任一层停用、未处于任一冷却/熔断期）。
 func (e *entry) healthy(now time.Time) bool {
-	if e.disabled {
+	// 停用两层正交（系统判定 / 人工停用），任一生效即不可选。
+	if e.disabled || e.manualDisabled {
+		return false
+	}
+	// 额度冻结优先于一切时间判断：余额为 0 时"等时间"没有意义（到点也不会自己有钱），
+	// 必须等额度探测确认恢复（签到/套餐周期刷新）才解冻；frozenUntil 只是安全网。
+	if e.frozen && (e.frozenUntil.IsZero() || now.Before(e.frozenUntil)) {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -104,8 +171,8 @@ func (e *entry) healthy(now time.Time) bool {
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	if !e.healthy(now) && reqModel != "" && e.softRateModel != "" &&
 		e.coolKind == CoolSoft && e.softRateModel != reqModel {
-		// 非 healthy 但属于可豁免场景：仍受 disabled/breakerUntil 约束。
-		return !e.disabled && e.breakerUntil.IsZero()
+		// 非 healthy 但属于可豁免场景：仍受两层停用/breakerUntil 约束。
+		return !e.disabled && !e.manualDisabled && e.breakerUntil.IsZero()
 	}
 	return e.healthy(now)
 }
@@ -139,12 +206,22 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
-	Disabled     bool      `json:"disabled"`
-	Reason       string    `json:"reason,omitempty"`
-	Until        time.Time `json:"until,omitempty"`
-	CoolKind     CoolKind  `json:"cool_kind"`
-	SuccessCount int64     `json:"success_count,omitempty"`
+	Credits  int64 `json:"credits"`
+	Disabled bool  `json:"disabled"`
+	// CreditsKnown 余额是否被上游真实观测过（旧文件缺此字段 → 见 applyAccountsLocked 的兼容推断）。
+	CreditsKnown bool   `json:"credits_known,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	// ManualDisabled 人工停用层。旧 state.json 缺此字段 → false（该号正常参与轮转，向后兼容）。
+	ManualDisabled bool   `json:"manual_disabled,omitempty"`
+	ManualReason   string `json:"manual_reason,omitempty"`
+	// SelectionExcluded / SelectionPlacement / SelectionPriority 选号策略的按账号配置。
+	// 旧 state.json 缺这些字段 → 零值（不排除、优先级 0），该号行为与改造前完全一致（向后兼容）。
+	SelectionExcluded  bool      `json:"selection_excluded,omitempty"`
+	SelectionPlacement string    `json:"selection_placement,omitempty"`
+	SelectionPriority  int       `json:"selection_priority,omitempty"`
+	Until              time.Time `json:"until,omitempty"`
+	CoolKind           CoolKind  `json:"cool_kind"`
+	SuccessCount       int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64     `json:"err_total,omitempty"`
@@ -154,6 +231,10 @@ type stateAccount struct {
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak,omitempty"`
+	// CreditFrozen 额度冻结。旧 state.json 缺此字段 → false（该号正常参与轮转，向后兼容）。
+	CreditFrozen       bool      `json:"credit_frozen,omitempty"`
+	CreditFrozenReason string    `json:"credit_frozen_reason,omitempty"`
+	CreditFrozenUntil  time.Time `json:"credit_frozen_until,omitempty"`
 }
 
 // stateFile 持久化格式。

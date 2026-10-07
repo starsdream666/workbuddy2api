@@ -7,12 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/config"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/realm"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -21,8 +25,14 @@ import (
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
-	Pool           *pool.Pool
-	Upstream       *upstream.Client
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	// Realm 上游产品线（"cn" / "ai"）。非 cn 时启用"路径探测不到即跳过"：
+	// 注意路线别名（codebuddy）不会拿到自己的 scheduler 实例 —— 它与来源线共用账号池，
+	// 排程由来源线统一执行（见 cmd/server/main.go 的 IsRouteAlias 跳过）。
+	// 某任务在该线上返回 404（路径不存在）时标记 unsupported，本进程内不再重复尝试，
+	// 避免每次都把 404 当成需重试的失败（ai 线的运营功能可能与 CN 不完全对齐）。
+	Realm          string
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -40,16 +50,39 @@ type Config struct {
 	ActivityDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
+
+	// CreditWatchEnabled 额度巡检开关：定期查上游余额，余额为 0 → 冻结账号；
+	// 余额恢复 → 解冻。冻结期间账号不参与轮转（避免反复撞 429）。
+	CreditWatchEnabled bool
+	// CreditWatchInterval 巡检间隔；<=0 时用 defaultCreditWatchInterval。
+	CreditWatchInterval time.Duration
+	// CreditWatchScope 巡检范围："all" = 全量账号（能主动发现余额为 0 的号）；
+	// 其他（含空）= 只查冻结中的账号（只做解冻判断，开销随冻结数变化）。
+	CreditWatchScope string
 }
+
+// defaultCreditWatchInterval 巡检间隔默认值（与 config.Schedule 的默认保持一致）。
+const defaultCreditWatchInterval = 30 * time.Minute
 
 // Scheduler 调度器。
 type Scheduler struct {
-	cfg Config
+	cfg            Config
+	runtime        atomic.Pointer[Config]
+	wake           chan struct{}
+	creditWake     chan struct{}
+	running        atomic.Bool
+	operationsOnce sync.Once
+	operations     chan struct{}
 
 	// mu/adoptTried 领养当日失败记录：uid → 自然日（CST）。门槛未达的账号当日不再重试，
 	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
 	mu         sync.Mutex
 	adoptTried map[string]string
+
+	// capMu/unsupported 该 realm 上"探测到不支持"的任务 → 原因（进程内缓存，重启清零）。
+	// 只在 cfg.Realm 非 cn 时生效；命中即跳过整类任务，不再对上游反复发无望请求。
+	capMu       sync.Mutex
+	unsupported map[taskKind]string
 }
 
 // New 构建。
@@ -70,7 +103,7 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string)}
+	return &Scheduler{cfg: cfg, wake: make(chan struct{}, 1), creditWake: make(chan struct{}, 1), adoptTried: make(map[string]string), unsupported: make(map[taskKind]string)}
 }
 
 // nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
@@ -98,26 +131,83 @@ const (
 	taskKeepalive
 )
 
+// String 任务名（日志与能力标记用）。
+func (k taskKind) String() string {
+	switch k {
+	case taskCheckin:
+		return config.TaskCheckin
+	case taskTravel:
+		return config.TaskTravel
+	case taskActivity:
+		return config.TaskActivity
+	case taskKeepalive:
+		return config.TaskKeepalive
+	default:
+		return "unknown"
+	}
+}
+
+// autoSkipUnsupported 是否启用"探测不到即跳过"：仅非 cn 线启用（cn 为既有生产路径，
+// 偶发 404 走既有短冷却即可，不改行为）。
+func (s *Scheduler) autoSkipUnsupported() bool {
+	rn := strings.ToLower(strings.TrimSpace(s.cfg.Realm))
+	return rn != "" && rn != realm.CN
+}
+
+// unsupportedReason 返回该任务是否已被标记为"上游不支持"。
+func (s *Scheduler) unsupportedReason(k taskKind) (string, bool) {
+	if !s.autoSkipUnsupported() {
+		return "", false
+	}
+	s.capMu.Lock()
+	defer s.capMu.Unlock()
+	r, ok := s.unsupported[k]
+	return r, ok
+}
+
+// noteUnsupported 记录"该 realm 不支持该任务"：只在明确的 404（路径不存在）时标记，
+// 5xx / 限流 / 网络抖动不标记（那是临时故障，不该永久跳过）。
+func (s *Scheduler) noteUnsupported(k taskKind, err error) {
+	if !s.autoSkipUnsupported() || err == nil {
+		return
+	}
+	var ue *upstream.Error
+	if !errors.As(err, &ue) || ue.Kind != upstream.ErrNotFound {
+		return
+	}
+	s.capMu.Lock()
+	defer s.capMu.Unlock()
+	if _, ok := s.unsupported[k]; ok {
+		return
+	}
+	s.unsupported[k] = err.Error()
+	log.Printf("WARN: [scheduler] realm=%s task=%s 上游不支持该路径（%v）→ 本进程内跳过该任务", s.cfg.Realm, k, err)
+}
+
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
 func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+	return nextWakeFor(s.CurrentConfig(), now)
+}
+
+func nextWakeFor(cfg Config, now time.Time) (time.Time, []taskKind) {
 	type slot struct {
 		at   time.Time
 		kind taskKind
 	}
 	var slots []slot
-	if !s.cfg.CheckinDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
+	if !cfg.CheckinDisabled {
+		slots = append(slots, slot{nextFire(now, cfg.CheckinHours), taskCheckin})
 	}
-	if !s.cfg.TravelDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
+	if !cfg.TravelDisabled {
+		slots = append(slots, slot{nextFire(now, cfg.TravelHours), taskTravel})
 	}
-	if !s.cfg.ActivityDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
+	if !cfg.ActivityDisabled {
+		slots = append(slots, slot{nextFire(now, cfg.ActivityHours), taskActivity})
 	}
-	if !s.cfg.KeepaliveDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
+	if !cfg.KeepaliveDisabled {
+		slots = append(slots, slot{nextFire(now, cfg.KeepaliveHours), taskKeepalive})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -142,31 +232,57 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
+	if !s.running.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.running.Store(false)
+	done := make(chan struct{})
+	go func() { defer close(done); s.creditWatchLoop(ctx) }()
+	defer func() { <-done }()
 	for {
-		next, kinds := s.nextWake(time.Now())
+		generation := s.runtime.Load()
+		cfg := s.cfg
+		if generation != nil {
+			cfg = *generation
+		}
+		next, kinds := nextWakeFor(cfg, time.Now())
 		if next.IsZero() {
-			// 四类任务全部禁用：不空转，只等退出信号。
-			<-ctx.Done()
-			return
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.wake:
+				continue
+			}
 		}
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
+		case <-s.wake:
+			timer.Stop()
+			continue
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			for _, k := range kinds {
+				if err := s.lockOperations(ctx); err != nil {
+					return
+				}
+				if !sameSchedule(cfg, s.CurrentConfig()) {
+					s.unlockOperations()
+					break
+				}
 				switch k {
 				case taskCheckin:
-					s.RunCheckinNow()
+					s.runCheckin()
 				case taskTravel:
-					s.RunTravelNow()
+					s.runTravel()
 				case taskActivity:
-					s.RunActivityNow()
+					s.runActivity()
 				case taskKeepalive:
-					s.RunKeepaliveNow()
+					s.runKeepalive()
 				}
+				s.unlockOperations()
 			}
 		}
 	}
@@ -176,21 +292,33 @@ func (s *Scheduler) Run(ctx context.Context) {
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 func (s *Scheduler) RunCheckinNow() {
+	s.lockOperations(context.Background())
+	defer s.unlockOperations()
+	s.runCheckin()
+}
+
+func (s *Scheduler) runCheckin() {
+	if reason, skip := s.unsupportedReason(taskCheckin); skip {
+		log.Printf("INFO: [scheduler] realm=%s checkin skipped (unsupported: %s)", s.cfg.Realm, reason)
+		return
+	}
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Stopped() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+		if err := s.CurrentConfig().Upstream.DailyCheckin(a); err != nil {
 			log.Printf("checkin %s: %v", logfmt.UID8(st.UID), err)
+			s.noteUnsupported(taskCheckin, err) // 路径不存在 → 该线跳过签到
 			// 已签到等业务错误也继续走余额查询
 		}
-		remain, err := s.cfg.Upstream.UserResource(a)
+		remain, err := s.CurrentConfig().Upstream.UserResource(a)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
+			s.noteUnsupported(taskCheckin, err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
@@ -212,14 +340,24 @@ func (s *Scheduler) RunCheckinNow() {
 // 豁免 adoptTriedToday 当日防抖（旅行排程 09 点已领养过且 skip，10 点上报补满后
 // 不能依赖下一轮旅行领养，就地闭环）。
 func (s *Scheduler) RunActivityNow() {
-	count := s.cfg.ActivityReportCount
+	s.lockOperations(context.Background())
+	defer s.unlockOperations()
+	s.runActivity()
+}
+
+func (s *Scheduler) runActivity() {
+	if reason, skip := s.unsupportedReason(taskActivity); skip {
+		log.Printf("INFO: [scheduler] realm=%s activity skipped (unsupported: %s)", s.cfg.Realm, reason)
+		return
+	}
+	count := s.CurrentConfig().ActivityReportCount
 	first := true
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Stopped() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
 		if !first {
@@ -231,9 +369,10 @@ func (s *Scheduler) RunActivityNow() {
 		ok := 0
 		for i := 1; i <= count; i++ {
 			rid := fmt.Sprintf("%s-r%d", cid, i)
-			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
+			if err := s.CurrentConfig().Upstream.ReportChatActivity(a, cid, rid); err != nil {
 				log.Printf("activity %s: report %d/%d: %v", logfmt.UID8(a.UID), i, count, err)
-				break // 本号上报失败：不再续发，streak 自检无意义
+				s.noteUnsupported(taskActivity, err) // 路径不存在 → 该线跳过活跃上报
+				break                                // 本号上报失败：不再续发，streak 自检无意义
 			}
 			log.Printf("activity %s: report %d/%d ok", logfmt.UID8(a.UID), i, count)
 			ok++
@@ -257,7 +396,7 @@ func (s *Scheduler) RunActivityNow() {
 // 日志每号一行、一眼可 grep：`activity %s: streak days=%d`（成功也打，方便对账）。
 // 返回 true 表示「上报 OK 但 streak 可疑」（days==0 或回读失败），供测试断言。
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
-	days, err := s.cfg.Upstream.GrowthStreak(a)
+	days, err := s.CurrentConfig().Upstream.GrowthStreak(a)
 	if err != nil {
 		log.Printf("WARN: activity %s: streak check failed (report OK): %v", logfmt.UID8(a.UID), err)
 		return true
@@ -275,15 +414,21 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.lockOperations(context.Background())
+	defer s.unlockOperations()
+	s.runKeepalive()
+}
+
+func (s *Scheduler) runKeepalive() {
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Stopped() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+		if err := s.CurrentConfig().Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.UID8(st.UID), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {

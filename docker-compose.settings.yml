@@ -1,0 +1,9 @@
+# Optional overlay for editing service settings in /admin.
+# First create ./settings and copy your existing config.json to
+# ./settings/config.json. Keep that directory writable by the container user.
+# docker compose -f docker-compose.yml -f docker-compose.settings.yml up -d --build
+services:
+  wb2api:
+    entrypoint: ["/app/wb2api", "-config", "/app/settings/config.json"]
+    volumes:
+      - ./settings:/app/settings

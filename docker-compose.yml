@@ -1,13 +1,60 @@
+# workbuddy2api —— 自托管 OpenAI 兼容网关（双产品线 realm：cn / ai）
+#
+# 常用命令：
+#   docker compose up -d --build          # 构建并启动
+#   docker compose logs -f wb2api         # 看日志（含每请求一行表格日志）
+#   docker compose exec wb2api /app/login url -realm ai   # 容器内取 OAuth 授权链接
+#   docker compose exec wb2api /app/signin_bin            # 容器内批量签到
+#   docker compose down                   # 停止
+#
+# 首次使用前：cp config.example.json config.json ，启动后在 /admin 设置管理员并创建访问密钥。
 services:
   wb2api:
-    build: .
+    build:
+      context: .
+      args:
+        # 受限网络（Docker Hub / Go proxy 不通）时用本地代理构建：
+        #   BUILD_PROXY=http://host.docker.internal:7890 docker compose build
+        # 容器内的 127.0.0.1 不是宿主机，故用 host.docker.internal；不传 = 直连。
+        HTTP_PROXY: ${BUILD_PROXY:-}
+        HTTPS_PROXY: ${BUILD_PROXY:-}
+        NO_PROXY: ${BUILD_NO_PROXY:-localhost,127.0.0.1,.tencent.com,.workbuddy.ai,.codebuddy.cn}
+        GOPROXY: ${BUILD_GOPROXY:-}
+    image: workbuddy2api:local
     container_name: workbuddy2api
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
+      # 也可全部用环境变量覆盖（优先级高于 config.json，非空才生效）：
+      # - WB2A_ADMIN_USERNAME=admin
+      # - WB2A_ADMIN_PASSWORD=自选长口令（仅首次初始化后移除）
+      # - WB2A_SECURE_COOKIE=true  # HTTPS 反代部署
+      # - WB2A_REALM=ai            # 默认路由到 WorkBuddy AI 线
+      # - WB2A_LISTEN=:7863
+      # 上游（www.workbuddy.ai / *.tencent.com）国内可直连；若你的网络需要代理出网：
+      # - HTTPS_PROXY=http://host.docker.internal:7890
+      # - NO_PROXY=localhost,127.0.0.1,.tencent.com,.workbuddy.ai
     ports:
       - "7863:7863"
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
+      # 管理页保存设置需可写目录；参见 docker-compose.settings.yml 和 README。
+      # 可选：把 WorkBuddy AI 桌面端凭证目录只读挂进来，容器内直接复用桌面端登录态：
+      #   docker compose exec wb2api /app/importauth -source /desktop-auth/workbuddy-desktop-ai.info
+      # Windows 示例（用户名按需改；桌面端凭证目录见 README「接入方式一」）
+      # - "C:/Users/86156/AppData/Local/CodeBuddyExtension/Data/Public/auth:/desktop-auth:ro"
+      # macOS 示例
+      # - "${HOME}/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/desktop-auth:ro"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7863/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,34 +1,55 @@
 #!/usr/bin/env bash
-# login.sh — WorkBuddy CN OAuth 登录 → 落盘 auth 文件
+# login.sh — WorkBuddy OAuth 登录 → 落盘 auth 文件（按产品线 realm）
 #
 # 用法:
-#   ./login.sh
+#   ./login.sh                # 默认 cn：CodeBuddy CN（copilot.tencent.com / www.codebuddy.cn）
+#   ./login.sh workbuddy      # WorkBuddy AI（www.workbuddy.ai，桌面端那条线；旧名 ai 等价）
+#   ./login.sh codebuddy      # CodeBuddy IDE 域（www.codebuddy.ai，workbuddy 的路线别名）
 #
 # 流程:
 #   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
 #   2. 你在浏览器打开 URL 完成登录
-#   3. 回到这里按 y → poll 拿 token+uid+nickname → 签到 → 落盘 auths/workbuddy-<uid>.json
+#   3. 回到这里按 y → poll 拿 token+uid+nickname → 签到 → 落盘 auth 文件
+#      （cn: auths/workbuddy-<uid>.json；workbuddy/codebuddy: auths/workbuddy-ai-<uid>.json，含 realm 字段）
 #   4. 重启 workbuddy2api 容器加载新账号
+#
+# 提示：若本机已装 WorkBuddy 桌面端并登录过，可跳过本脚本，直接
+#   go run ./cmd/importauth
+# 复用桌面端凭证（见 README「WorkBuddy AI 线」）。
 set -euo pipefail
 
 cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
 
+# 产品线（realm）：cn（默认）/ workbuddy / codebuddy；旧名 ai 仍然接受（等价 workbuddy）。
+# codebuddy 是 workbuddy 的**路线别名**（同一后端、同一账号空间）：它的凭证按来源线 workbuddy 归档，
+# 因此这里 FILE_PREFIX 与写入的 realm 都取 workbuddy（绝不会另起一个 codebuddy 池）。
+REALM="${1:-cn}"
+case "$REALM" in
+    cn)           REALM_LABEL="CodeBuddy CN";  BILLING_BASE="https://www.codebuddy.cn";   FILE_PREFIX="workbuddy";    AUTH_REALM="cn" ;;
+    workbuddy|ai) REALM_LABEL="WorkBuddy AI";  BILLING_BASE="https://www.workbuddy.ai"; FILE_PREFIX="workbuddy-ai"; AUTH_REALM="workbuddy" ;;
+    codebuddy)    REALM_LABEL="CodeBuddy IDE"; BILLING_BASE="https://www.codebuddy.ai"; FILE_PREFIX="workbuddy-ai"; AUTH_REALM="workbuddy" ;;
+    *)            echo "未知 realm: $REALM（可选 cn / workbuddy / codebuddy；旧名 ai 等价 workbuddy）" >&2; exit 1 ;;
+esac
+
 mkdir -p "$AUTH_DIR"
 
-# login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
+# login 工具：优先用现成的；容器内镜像已预编译为 /app/login（无 Go 源码，不能现场编译）
 LOGIN_BIN="./login"
+if [[ ! -x "$LOGIN_BIN" && -x "/app/login" ]]; then
+    LOGIN_BIN="/app/login"
+fi
 if [[ ! -x "$LOGIN_BIN" ]]; then
     go build -o "$LOGIN_BIN" ./cmd/login
 fi
 
 echo "============================================================"
-echo "  WorkBuddy OAuth 登录"
+echo "  WorkBuddy OAuth 登录（realm: $REALM — $REALM_LABEL）"
 echo "============================================================"
 echo ""
 
-AUTH_URL=$("$LOGIN_BIN" url)
+AUTH_URL=$("$LOGIN_BIN" url -realm "$REALM")
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
@@ -51,7 +72,7 @@ fi
 echo ""
 echo "正在获取 token..."
 
-RESULT=$("$LOGIN_BIN" poll) || {
+RESULT=$("$LOGIN_BIN" poll -realm "$REALM") || {
     echo ""
     echo "获取 token 失败。可能原因："
     echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
@@ -74,12 +95,12 @@ fi
 
 EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
-# ─── 签到（CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞）───
+# ─── 签到（POST <billing_base>/v2/billing/meter/daily-checkin，幂等不阻塞）───
 python3 - <<PYEOF
 import json, urllib.request, urllib.error
 
 req = urllib.request.Request(
-    "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
+    "$BILLING_BASE/v2/billing/meter/daily-checkin",
     method="POST", data=b"{}",
     headers={
         "Authorization": "Bearer $TOKEN",
@@ -109,7 +130,7 @@ except Exception as e:
 PYEOF
 
 # ─── 落盘 auth 文件（与 internal/auth 读取格式一致）─────────────────
-AUTH_FILE="$AUTH_DIR/workbuddy-${USER_ID}.json"
+AUTH_FILE="$AUTH_DIR/${FILE_PREFIX}-${USER_ID}.json"
 if [[ -f "$AUTH_FILE" ]]; then
     echo "账号已存在（uid=${USER_ID}），将覆盖更新凭证"
     ACTION="覆盖"
@@ -121,6 +142,7 @@ python3 - <<PYEOF
 import json
 
 auth = {
+    "realm": "$AUTH_REALM",
     "account": {
         "uid": "$USER_ID",
         "enterpriseId": "$ENT_ID",
@@ -138,9 +160,14 @@ with open("$AUTH_FILE", "w") as f:
 print(f"已保存（${ACTION}）: $AUTH_FILE")
 PYEOF
 
-# ─── 重启服务 ────────────────────────────────────────────
+# ─── 重启服务（容器内运行时跳过：容器内没有 docker CLI）──────────
 echo ""
-if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
+if [[ -f /.dockerenv ]]; then
+    # 容器内登录：auth 文件已写入挂载卷（/app/auths），账号池需重启才重新加载目录
+    echo "检测到容器内运行：auth 文件已写入 ${AUTH_DIR}（挂载卷）。"
+    echo "请在宿主机执行以下命令让账号池加载新账号："
+    echo "  docker compose restart ${CONTAINER}"
+elif docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "重启 $CONTAINER 加载新账号..."
     docker restart "$CONTAINER" >/dev/null
     sleep 2
@@ -157,6 +184,7 @@ echo "============================================================"
 echo "  登录完成！"
 echo "  UID: $USER_ID"
 echo "  Nickname: ${NICKNAME:-（未获取到）}"
+echo "  Realm: $REALM → auth 文件按来源线 $AUTH_REALM 归档（${FILE_PREFIX}-${USER_ID}.json）"
 echo "  Token: ${TOKEN:0:30}..."
 echo "  有效期: $(date -d "@$EXPIRES_AT" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$EXPIRES_AT")"
 echo "============================================================"

@@ -11,7 +11,10 @@ func (p *Pool) SetCredits(uid string, credits int64) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
-		p.dirty.Store(true)
+		e.creditsKnown = true
+		// 权威余额覆盖 → 清零本地扣减的小数余量（同 ReconcileCredits）。
+		e.creditFrac = 0
+		p.markDirty()
 	}
 }
 
@@ -39,7 +42,7 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		// softRateModel 泄漏到本次**账号级**限流上（否则换模型请求会错误绕过本次冷却）。
 		e.softRateModel = ""
 		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
-		p.dirty.Store(true)
+		p.markDirty()
 	}
 }
 
@@ -88,7 +91,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			e.softRateModel = ""
 		}
 		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
-		p.dirty.Store(true)
+		p.markDirty()
 	}
 }
 
@@ -165,9 +168,12 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// Disable 永久禁用（session 死亡），需人工重登后手工恢复或文件替换。
+// reviveCoolingLocked 余额恢复时清冷却（调用方持锁）。
 func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
+	e.creditsKnown = true
 	e.credits = credits
+	// 权威余额覆盖 → 清零本地扣减的小数余量（同 ReconcileCredits/SetCredits）。
+	e.creditFrac = 0
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""

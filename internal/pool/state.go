@@ -15,7 +15,7 @@ func (p *Pool) Disable(uid, reason string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.disabled = true
 		e.reason = reason
-		p.dirty.Store(true)
+		p.markDirty()
 	}
 }
 
@@ -42,7 +42,7 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 	e.disabled = true
 	e.reason = sessionDeadReason
 	e.sessionDeadFails = 0
-	p.dirty.Store(true)
+	p.markDirty()
 	return true
 }
 
@@ -67,7 +67,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
-		p.dirty.Store(true)
+		p.markDirty()
 	}
 }
 
@@ -80,14 +80,24 @@ func (p *Pool) ReviveDisabled(uid string) {
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain)
-		} else {
-			e.credits = remain
-		}
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	switch {
+	case remain > 0 && !e.disabled:
+		// 余额恢复：清时间冷却（历史 CoolHard 语义）+ 解冻。
+		p.reviveCoolingLocked(e, remain)
+		p.unfreezeLocked(e)
+	case remain <= 0:
+		// 余额为 0：**冻结**。签到/余额查询是除额度巡检之外的第二个观测点，
+		// 它若只更新缓存不冻结，账号会继续留在轮转里白撞 429/402。
+		e.credits = remain
+		e.creditsKnown = true
+		e.creditFrac = 0 // 权威余额覆盖 → 清零本地小数余量
+		p.freezeLocked(e, "额度耗尽（签到）")
+	}
+	p.markDirty()
 }
 
 // NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal。
@@ -99,7 +109,7 @@ func (p *Pool) NoteError(uid string) {
 		e.errTotal++
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
-		p.dirty.Store(true)
+		p.markDirty()
 	}
 }
 
@@ -118,7 +128,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
-		p.dirty.Store(true)
+		p.markDirty()
 	}
 }
 
@@ -166,6 +176,10 @@ func (p *Pool) AvailableUIDs() []string {
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
 func (p *Pool) PickByUID(uid string) *auth.Auth {
+	return p.PickByUIDForModel(uid, "", "")
+}
+
+func (p *Pool) PickByUIDForModel(uid, model, route string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -173,7 +187,7 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthy(now) {
+	if !e.healthyForModel(now, model) || p.floorBlocked(e, route, model, now) {
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -185,7 +199,9 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
 // cooling 含常规冷却（until）与熔断期（breakerUntil）。
-// 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；
+// disabled 是**两层停用并计**（系统判定 + 人工停用）：对外口径是"不参与调度"，与选号
+// 的 healthy 一致；要区分谁停的看 /status 的逐账号 disabled / manual_disabled 字段。
+// 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看两层停用/until/breakerUntil）；
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
@@ -195,7 +211,9 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 	for _, e := range p.byUID {
 		total++
 		switch {
-		case e.disabled:
+		case e.disabled || e.manualDisabled:
+			// 两层停用并计：只算 e.disabled 会把人工停用的号落进 cooling 分支，
+			// 让运维以为它在等限流恢复。
 			disabled++
 		case !e.healthy(now):
 			cooling++
@@ -246,9 +264,15 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		UID:             uid,
 		Nickname:        e.a.Nickname,
 		Credits:         e.credits,
+		CreditsExact:    exactCredits(e),
+		CreditsKnown:    e.creditsKnown,
 		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:          e.reason,
 		Disabled:        e.disabled,
+		ManualDisabled:  e.manualDisabled,
+		ManualReason:    e.manualReason,
+		Frozen:          e.frozen,
+		FrozenReason:    e.frozenReason,
 		SuccessCount:    e.successCount,
 		ErrTotal:        e.errTotal,
 		LastSuccessTime: e.lastSuccess,
@@ -258,6 +282,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:        int(e.inFlight.Load()),
 		BreakerFails:    e.fails,
 		BreakerUntil:    e.breakerUntil,
+
+		SelectionExcluded:  e.selExcluded,
+		SelectionPlacement: e.selPlacement,
+		SelectionPriority:  e.selPriority,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -272,6 +300,48 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.CoolKind = e.coolKind.String()
 	}
 	return st
+}
+
+// exactCredits 计算含小数扣减的真实可用额度 = credits - creditFrac。
+//
+// 语义边界（重要）：余额**未知**时返回 0 而不是 -creditFrac。
+// 未知状态的 credits=0 含义是"从没观测过"，此时任何相减都会把它伪装成
+// "余额为 0 或负数"，而两者在选号与冻结判定上完全不同（未知要优先探测，
+// 0 则是耗尽）。所以未知时一律回落到裸 credits（即 0）。
+//
+// 钳 0：扣减路径本身会把负余额钳到 0（见 DeductCredits），
+// 但浮点误差可能让 credits - creditFrac 落到 -1e-9 这种量级，
+// 显示成 "-0.00" 很刺眼，故此处再钳一次。
+func exactCredits(e *entry) float64 {
+	if !e.creditsKnown {
+		return float64(e.credits)
+	}
+	v := float64(e.credits) - e.creditFrac
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+// CreditsKnownOf 报告该账号余额是否被上游真实观测过（供调用日志做差值判定）。
+func (p *Pool) CreditsKnownOf(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	return ok && e.creditsKnown
+}
+
+// CreditsOf 返回账号当前缓存的余额（第二个返回值为账号是否存在）。
+// 注意语义：这是**最近一次上游观测**的快照，不含未刷新的实时值；
+// creditsKnown=false 时余额的 0 表示"从未观测"，调用方需自行区分。
+func (p *Pool) CreditsOf(uid string) (int64, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return 0, false
+	}
+	return e.credits, true
 }
 
 // ---------------------------------------------------------------------------

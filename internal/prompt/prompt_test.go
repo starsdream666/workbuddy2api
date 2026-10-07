@@ -190,16 +190,40 @@ func TestRewriteEmptyPromptReturnedAsIs(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultWhenFileEmpty(t *testing.T) {
+// TestLoadEmptyFileReturnsNoPrompt 未配置 prompt.file 时**不返回任何提示词**：
+// 网关不内置提示词，Load 只回空串（调用方据此按 passthrough 处理）。
+func TestLoadEmptyFileReturnsNoPrompt(t *testing.T) {
 	got, err := Load("custom", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != defaultPrompt {
-		t.Errorf("Load() returned non-default prompt (len=%d vs %d)", len(got), len(defaultPrompt))
+	if got != "" {
+		t.Errorf("Load()=%q want 空（不再回落内置文案）", got)
 	}
-	if len(got) == 0 {
-		t.Error("default prompt is empty")
+}
+
+// TestStripSystemRemovesSystemAndDeveloper 降级重试走"剥离子集"：只删 system/developer，
+// 不注入任何文案；没有 system 时逐字原样返回。
+func TestStripSystemRemovesSystemAndDeveloper(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[{"role":"system","content":"CLI_TEMPLATE_LINE"},{"role":"developer","content":"DEV_NOTE"},{"role":"user","content":"hi"}]}`)
+	out := StripSystem(in)
+	roles := systemRoles(t, out)
+	if len(roles) != 1 || roles[0] != "user" {
+		t.Fatalf("roles=%v want [user]", roles)
+	}
+	if strings.Contains(string(out), "CLI_TEMPLATE_LINE") || strings.Contains(string(out), "DEV_NOTE") {
+		t.Errorf("system/developer 内容应被剥离: %s", out)
+	}
+	if !strings.Contains(string(out), `"model":"m"`) {
+		t.Errorf("其他字段应原样保留: %s", out)
+	}
+	same := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	if got := string(StripSystem(same)); got != string(same) {
+		t.Errorf("无 system/developer 时应逐字原样返回: %s", got)
+	}
+	bad := []byte(`{not json`)
+	if got := string(StripSystem(bad)); got != string(bad) {
+		t.Errorf("非 JSON 应原样返回: %s", got)
 	}
 }
 

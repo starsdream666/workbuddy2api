@@ -1,12 +1,14 @@
 package server
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -38,7 +40,7 @@ func withChatLog(t *testing.T) {
 }
 
 func TestChatStatsReaderTokensFromUsage(t *testing.T) {
-	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now())
+	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now().Add(-time.Millisecond))
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
@@ -57,6 +59,38 @@ func TestChatStatsReaderNoUsage(t *testing.T) {
 	_, _ = io.Copy(io.Discard, r)
 	if toks, ok := r.Tokens(); ok || toks != 0 {
 		t.Errorf("tokens=%d ok=%v, want 0/false for missing usage", toks, ok)
+	}
+}
+
+func TestChatStatsReaderMultilineUsage(t *testing.T) {
+	raw := "data:{\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\r\ndata:\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"credit\":0.5}}\r\n\r\ndata:[DONE]\n\ndata:{\"usage\":{\"completion_tokens\":99}}\n\n"
+	r := newChatStatsReaderSince(iotest.OneByteReader(strings.NewReader(raw)), time.Now().Add(-time.Second))
+	got, err := io.ReadAll(r)
+	if err != nil || string(got) != raw {
+		t.Fatalf("read=%q err=%v", got, err)
+	}
+	tokens, ok := r.Tokens()
+	if !ok || tokens != 3 || r.Prompt() != 7 {
+		t.Fatalf("tokens=%d prompt=%d ok=%t", tokens, r.Prompt(), ok)
+	}
+}
+
+type dataAndErrorReader struct{ read bool }
+
+func (r *dataAndErrorReader) Read(p []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+	r.read = true
+	return copy(p, "data: {}"), io.ErrUnexpectedEOF
+}
+
+func TestChatStatsReaderPreservesReadError(t *testing.T) {
+	r := newChatStatsReaderSince(&dataAndErrorReader{}, time.Now())
+	buf := make([]byte, 64)
+	n, err := r.Read(buf)
+	if n != 8 || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("n=%d err=%v", n, err)
 	}
 }
 
@@ -199,7 +233,7 @@ func TestChatLogsStreamRow(t *testing.T) {
 	})
 	out := captureStdout(t, func() {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 		h.ServeHTTP(rec, req)
 		if rec.Code != 200 {
 			t.Fatalf("code=%d", rec.Code)
@@ -226,7 +260,7 @@ func TestChatLogsSyncRowTTFBDash(t *testing.T) {
 	})
 	out := captureStdout(t, func() {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 		h.ServeHTTP(rec, req)
 		if rec.Code != 200 {
 			t.Fatalf("code=%d", rec.Code)
@@ -248,7 +282,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	out := captureStdout(t, func() {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 		h.ServeHTTP(rec, req)
 		if rec.Code != 503 {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)

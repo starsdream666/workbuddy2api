@@ -1,10 +1,26 @@
 {
   "listen": ":7863",
-  "api_key": "test_key",
+  "security": {
+    "store_file": "./data/access.json",
+    "secure_cookie": false
+  },
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
     "max_body_mb": 8
+  },
+  "console": {
+    "enabled": true
+  },
+  "realms": {
+    "workbuddy": {},
+    "codebuddy": {
+      "auth_realm": "workbuddy"
+    }
+  },
+  "model_prefixes": {
+    "workbuddy": "workbuddy",
+    "codebuddy": "codebuddy"
   },
   "cooldown": {
     "soft_rate": "600s",
@@ -18,19 +34,54 @@
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
-    "keepalive_enabled": true
+    "keepalive_enabled": true,
+    "credit_watch_enabled": true,
+    "credit_watch_interval": "30m",
+    "credit_watch_scope": "frozen",
+    "credit_freeze_max": "72h",
+    "realm_tasks": {
+      "workbuddy": {
+        "checkin": true,
+        "travel": true,
+        "activity": true,
+        "keepalive": true
+      }
+    }
   },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
-    "user_agent": ""
+    "user_agent": "",
+    "realm": "cn",
+    "realm_overrides": {
+      "workbuddy": {
+        "chat_base": "",
+        "billing_base": "",
+        "platform": "",
+        "origin": "",
+        "fingerprint": "workbuddy-desktop",
+        "client_version": "5.5.2",
+        "user_agent": ""
+      },
+      "codebuddy": {
+        "chat_base": "",
+        "billing_base": "",
+        "platform": "",
+        "origin": "",
+        "fingerprint": "",
+        "client_version": "",
+        "user_agent": ""
+      }
+    }
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "prompt_cache_key": true,
+    "repair_tool_history": false
   },
   "prompt": {
-    "mode": "custom",
+    "mode": "passthrough",
     "file": ""
   },
   "upstash": {
@@ -38,16 +89,27 @@
     "token": ""
   },
   "pool": {
+    "credit_floor": 0,
     "max_in_flight": 3,
     "breaker_threshold": 3,
     "breaker_cooldown": "30m",
     "breaker_cooldown_max": "6h",
     "idle_weight_per_hour": 0.5,
-    "idle_weight_max": 5.0
+    "idle_weight_max": 5.0,
+    "selection_mode": "weighted"
   },
   "session_sticky": {
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "usage_log": {
+    "enabled": true,
+    "file": "./data/usage.jsonl",
+    "memory_size": 500,
+    "max_size_mb": 32,
+    "max_backups": 1,
+    "refresh_balance": true,
+    "calibrate_interval": "5m"
   }
 }
