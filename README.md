@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-v1.1.0-119c76?style=flat-square">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Docker_Compose-2496ED?logo=docker&logoColor=white&style=flat-square">
@@ -33,6 +34,12 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 CodeBuddy 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
 ## 核心能力
+
+### v1.1.0：控制台主题
+
+点击控制台右上角「网关在线」与「管理账号」之间的「主题」按钮，即可切换 **默认、薄荷微光、精密网格、柔和几何** 四套外观。默认主题保留原有样式，新增主题提供不同的背景装饰和页面动效。
+
+主题即时生效，无需刷新页面，当前页面及筛选条件保持不变；选择自动保存在当前浏览器，并在同源标签页间同步。支持键盘操作、移动端布局及系统「减少动态效果」偏好。
 
 | 能力 | 说明 |
 |---|---|

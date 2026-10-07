@@ -35,6 +35,9 @@ var consoleHTML []byte
 //go:embed console/console.css
 var consoleCSS []byte
 
+//go:embed console/theme.js
+var consoleThemeJS []byte
+
 //go:embed console/metrics.js
 var consoleMetricsJS []byte
 
@@ -123,6 +126,7 @@ func (h *Handler) registerAdmin() {
 		body              []byte
 	}{
 		{"console.css", "text/css; charset=utf-8", consoleCSS},
+		{"theme.js", "text/javascript; charset=utf-8", consoleThemeJS},
 		{"metrics.js", "text/javascript; charset=utf-8", consoleMetricsJS},
 		{"console.js", "text/javascript; charset=utf-8", consoleJS},
 		{"tasks.js", "text/javascript; charset=utf-8", consoleTasksJS},

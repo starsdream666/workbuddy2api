@@ -12,6 +12,7 @@ func TestConsoleEmbeddedAssets(t *testing.T) {
 	for _, tc := range []struct{ path, mime, marker string }{
 		{"/admin", "text/html", "/admin/assets/console.js"},
 		{"/admin/assets/console.css", "text/css", ".sidebar"},
+		{"/admin/assets/theme.js", "text/javascript", "workbuddy.console.theme"},
 		{"/admin/assets/metrics.js", "text/javascript", "filterEntries"},
 		{"/admin/assets/console.js", "text/javascript", "initializeConsole"},
 		{"/admin/assets/tasks.js", "text/javascript", "loadTasks"},
