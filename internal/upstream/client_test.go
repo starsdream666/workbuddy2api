@@ -55,8 +55,15 @@ func TestClassify(t *testing.T) {
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
 		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		// 边缘网关错误页（5xx + HTML 文档）：请求未抵达业务层，属全局故障，不算账号问题。
+		// 回归锚点：实测 docker 日志里 upstream 502 的 body 就是上游的 HTML 错误页。
+		{502, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\" />", ErrUpstreamGateway},
+		{502, "  \n<!doctype html><html><head></head></html>", ErrUpstreamGateway},
+		{504, "<html><head><title>504 Gateway Time-out</title></head></html>", ErrUpstreamGateway},
+		// HTML 之外的 5xx 仍是 ErrServer（真·账号/接口故障），分类不能被宽化。
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
+		{502, `{"code":500,"msg":"internal error"}`, ErrServer},
 		{200, ``, ErrNone},
 	}
 	for _, c := range cases {
@@ -379,6 +386,48 @@ func TestUserResourceNegativeClamped(t *testing.T) {
 	remain, err := c.UserResource(&auth.Auth{AccessToken: "at"})
 	if err != nil || remain != 0 {
 		t.Errorf("remain=%d err=%v, want 0 (clamped)", remain, err)
+	}
+}
+
+// TestUserResourceMissingStructureIsError 结构缺失必须报错，不得当作「余额 = 0」。
+//
+// 回归锚点：上游降级 / 边缘网关改写 / 接口变更时，可能返回 code=0 但 Data 为 null 的
+// 空壳信封。旧实现把 Accounts 取不到当成「聚合 0 个套餐 → remain=0」，于是额度巡检与
+// 签到路径把它当成「余额耗尽」→ freezeLocked 冻结整池账号（且随 state.json 持久化，
+// 重启不恢复）。现在缺结构 → 错误 → 调用方走「查询失败不改状态」分支。
+func TestUserResourceMissingStructureIsError(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"Data 为 null", `{"code":0,"data":{"Response":{"Data":null}}}`},
+		{"Response 缺失", `{"code":0,"data":{}}`},
+		{"空壳信封", `{"code":0,"data":{"Response":{}}}`},
+		{"data 为 null", `{"code":0,"data":null}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.body
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				return jsonResp(200, body), nil
+			})
+			remain, err := c.UserResource(&auth.Auth{AccessToken: "at"})
+			if err == nil {
+				t.Fatalf("missing structure must be an error, got remain=%d nil err", remain)
+			}
+		})
+	}
+}
+
+// TestUserResourceEmptyAccountsIsZero 结构完整但 Accounts 为空 → 确实是 0（合法语义）。
+// 与上面的「缺结构」区分开：账号真没有可用套餐时余额就是 0，冻结是正确行为。
+func TestUserResourceEmptyAccountsIsZero(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`), nil
+	})
+	remain, err := c.UserResource(&auth.Auth{AccessToken: "at"})
+	if err != nil || remain != 0 {
+		t.Fatalf("remain=%d err=%v, want 0 + nil err", remain, err)
 	}
 }
 

@@ -36,6 +36,10 @@ const (
 	ErrClient                        // 其他 4xx / 业务错误
 	ErrPromptTooLong
 	ErrImageInvalid
+	// ErrUpstreamGateway 上游边缘网关故障（5xx + HTML 错误页）：CDN / 反向代理 / WAF
+	// 在请求抵达业务层之前挡下并整页返回。全局性故障，与账号凭证 / 余额 / 限流状态无关，
+	// 不该算到单个账号头上（否则一次边缘抖动会把整池健康账号逐个喂进熔断器）。
+	ErrUpstreamGateway
 )
 
 func (k ErrKind) String() string {
@@ -60,6 +64,8 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrUpstreamGateway:
+		return "upstream_gateway"
 	default:
 		return "none"
 	}
@@ -232,6 +238,11 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusNotFound {
 		return ErrNotFound
 	}
+	// 边缘网关错误页（5xx + HTML 文档）：请求未抵达上游业务接口，属全局故障。
+	// 判在通用 5xx 之前，避免把「上游整体不可用」记成「这个账号有问题」。
+	if status >= 500 && isGatewayErrorPage(body) {
+		return ErrUpstreamGateway
+	}
 	if status >= 500 {
 		return ErrServer
 	}
@@ -255,6 +266,17 @@ func Classify(status int, body string) ErrKind {
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
 	return ErrNone
+}
+
+// isGatewayErrorPage 报告 5xx 响应体是否是边缘网关（CDN / 反向代理 / WAF）的错误页。
+//
+// 判据只认「响应体本身就是 HTML 文档」（以文档声明或 <html 开头）：这类响应不是上游
+// 业务接口产生的，而是请求还没抵达业务层就被中间层挡下的整页错误。它与账号凭证、余额、
+// 限流状态全无关系 —— 若被当成「账号故障」，轮转会把整池账号逐个喂进熔断器
+// （MaxRotate 个账号/请求 × 阈值 3 次 ≈ 三个请求清空全池）。
+func isGatewayErrorPage(body string) bool {
+	t := strings.ToLower(strings.TrimSpace(body))
+	return strings.HasPrefix(t, "<!doctype html") || strings.HasPrefix(t, "<html")
 }
 
 // apiEnvelope 上游统一信封。
@@ -793,7 +815,7 @@ func (c *Client) UserResourceContext(ctx context.Context, a *auth.Auth) (remain 
 	}
 	var resp struct {
 		Response struct {
-			Data struct {
+			Data *struct {
 				Accounts []struct {
 					PackageName         string `json:"PackageName"`
 					CapacitySize        int64  `json:"CapacitySize"`
@@ -808,6 +830,13 @@ func (c *Client) UserResourceContext(ctx context.Context, a *auth.Auth) (remain 
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, fmt.Errorf("resource parse: %w", err)
+	}
+	// 结构缺失（Data / Response 为 null，信封却 code=0）绝不能被当成「余额 = 0」：
+	// 那会把一次上游降级 / 接口变更 / 边缘网关改写，直接变成「冻结整池账号」。
+	// 缺结构 → 返回错误，让调用方走「查询失败不改状态」的既有分支
+	// （见 credit_watch.go / maintenance.go / adminBalance：err != nil 时跳过，不动状态）。
+	if resp.Response.Data == nil {
+		return 0, fmt.Errorf("resource parse: missing Response.Data (body 结构不完整，不可判定余额)")
 	}
 	for _, acct := range resp.Response.Data.Accounts {
 		var r int64

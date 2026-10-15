@@ -1135,6 +1135,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request, protocol string) 
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError），passthrough 模式走降级重试。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
+//   - ErrUpstreamGateway → 不罚账号（同 ErrContentBlocked 待遇）：边缘网关整页错误，全局故障，
+//     换了账号也一样，罚账号只会把整池健康号逐个熔掉。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
@@ -1180,6 +1182,12 @@ func (h *Handler) applyErrorPolicyOn(pl *pool.Pool, uid string, kind upstream.Er
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		pl.NoteError(uid)
+	case upstream.ErrUpstreamGateway:
+		// 上游边缘网关故障（5xx + HTML 错误页，如 CDN / 反代 / WAF 挡下的整页错误）：
+		// 请求根本没抵达业务层，**不是账号的问题**。与 ErrContentBlocked 同待遇——
+		// 不冷却、不熔断、不计 errTotal，只换号重试。
+		// 若在此处喂 NoteError：一次上游 502 会沿轮转把 MaxRotate 个账号各记 1 次失败，
+		// 阈值 3 时三个请求就清空全池（健康号全部熔断 30m，表现为「所有凭证被冻结」）。
 	case upstream.ErrContentBlocked:
 		// 内容策略拦截（误报）：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 模式由 chatCompletions 内降级重试处理；custom 模式本不会到此分支。

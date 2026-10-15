@@ -1416,6 +1416,55 @@ func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	}
 }
 
+// TestUpstreamGatewayErrorDoesNotPenalizeAccount 上游边缘网关错误页（5xx + HTML）
+// 绝不喂账号熔断器 / errTotal——它是全局故障，与账号无关。
+//
+// 回归锚点：线上 docker 日志出现 `upstream 502 ... body=<!DOCTYPE html>` 后，
+// 所有凭证被熔断/冻结。根因两处，此为第一处：502 被 Classify 判成 ErrServer，
+// applyErrorPolicy 对它调 NoteError，于是轮转把 MaxRotate 个账号各记 1 次失败，
+// 阈值 3 时三个请求即清空整池。
+func TestUpstreamGatewayErrorDoesNotPenalizeAccount(t *testing.T) {
+	const gateway502 = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\" />\n</head>\n<body>502</body>\n</html>"
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 502, gateway502, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetBreaker(1, time.Hour, time.Hour) // 阈值 1：误罚一次即熔断
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s (want 503 no_healthy_account)", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Fatalf("ErrUpstreamGateway must not penalize account: %+v", st)
+	}
+}
+
+// TestUpstreamServerErrorStillPenalizesAccount 反向锁：真正的 5xx（非 HTML 错误页）
+// 仍按既有语义喂熔断——分类收窄不能把「账号/接口确实报错」也一并豁免。
+func TestUpstreamServerErrorStillPenalizesAccount(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 500, `{"code":500,"msg":"internal error"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetBreaker(1, time.Hour, time.Hour)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	st, _ := p.Status("u1")
+	if !st.Cooling {
+		t.Fatalf("ErrServer should still trip breaker with threshold=1: %+v", st)
+	}
+}
+
 // TestCustomModeFingerprintSanitizePreserved custom 端到端：user 消息含 Claude Code
 // 指纹句（PR39 fixture 串）→ Rewrite 注入自有 system → 经 sanitize → 出站 body 中
 // 该指纹被改写、system 为自有提示词。证明两层（提示词替换 + 清洗）叠加工作。

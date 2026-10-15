@@ -140,4 +140,39 @@ func TestCreditWatchQueryFailureKeepsState(t *testing.T) {
 	}
 }
 
+// TestCreditWatchMissingStructureDoesNotFreeze 上游返回「结构完整的空壳信封」时，
+// 余额查询必须**失败**而不是被读成 0——否则一次上游降级就会把整池账号冻结。
+//
+// 回归锚点：这是线上「所有凭证被冻结」的第二条根因。旧实现里
+// `{"code":0,"data":{"Response":{"Data":null}}}` 反序列化后 Accounts 为空，
+// 聚合结果 remain=0 且 err=nil → ReconcileCredits(uid, 0) → freezeLocked，
+// 且冻结随 state.json 持久化，重启也不恢复。
+func TestCreditWatchMissingStructureDoesNotFreeze(t *testing.T) {
+	creditWatchAccountDelay = 0
+	// 空壳信封：HTTP 200 + code=0，但 Response.Data 为 null。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":null}}}`))
+	}))
+	defer srv.Close()
+
+	p := creditWatchPool("u1", "u2")
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, CreditWatchEnabled: true, CreditWatchScope: "all"})
+
+	froze, unfroze := s.RunCreditWatchNow(true)
+	if froze != 0 || unfroze != 0 {
+		t.Fatalf("空壳响应不该翻转任何账号状态: froze=%d unfroze=%d", froze, unfroze)
+	}
+	for _, uid := range []string{"u1", "u2"} {
+		if p.IsFrozen(uid) {
+			t.Errorf("%s 被误冻结（结构缺失被当成余额 0）", uid)
+		}
+	}
+	// 账号仍应可服务：既没冻结也没冷却。
+	if a := p.Pick(); a == nil {
+		t.Error("查询失败后账号仍应可选（状态未被改动）")
+	}
+}
+
 var _ = json.Marshal

@@ -34,7 +34,10 @@ func realmCaptureTransport(c *realmCapture) http.RoundTripper {
 		c.ideName = r.Header.Get("X-IDE-Name")
 		c.ideVer = r.Header.Get("X-IDE-Version")
 		c.domain = r.Header.Get("X-Domain")
-		return jsonResp(200, `{"code":0,"data":{}}`), nil
+		// fixture 必须结构完整：UserResource 现在把「缺 Response.Data」判为查询失败
+		// （旧实现读成余额 0，会让巡检冻结整池账号）。本测试只验证 URL/UA 分派，
+		// 故给一个 Structure 完整、余额为 0 的合法响应。
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`), nil
 	})
 }
 
