@@ -63,6 +63,11 @@ type Totals struct {
 	Requests         int64   `json:"requests"`
 	Success          int64   `json:"success"`
 	Failed           int64   `json:"failed"`
+	// Canceled 客户端主动中断的请求数（HTTP 499）。
+	// 单列而不并进 Failed：499 不是上游/账号的故障，混进去会让「失败数」包含用户
+	// 自己按下的取消，排查时被引向一个并不存在的问题。
+	// 恒等式：Requests = Success + Failed + Canceled。
+	Canceled int64 `json:"canceled"`
 	PromptTokens     int64   `json:"prompt_tokens"`
 	CompletionTokens int64   `json:"completion_tokens"`
 	TotalTokens      int64   `json:"total_tokens"`
@@ -98,13 +103,21 @@ type Totals struct {
 // Add 累加一条记录。**唯一**的记账入口：整体统计与分组统计都走它，
 // 避免两处各写一套加法而在某个字段上悄悄分叉。
 //
-// 状态判定只认 2xx（与 handler 是否算成功一致）；非 2xx 计入 Failed。
+// 状态判定：2xx 算成功；**499 单列**（客户端主动中断，既非成功也非失败）；
+// 其余非 2xx 计入 Failed。
 // token 直接取记录里的三项（上游未给 usage 时它们本来就是 0）。
 func (t *Totals) Add(e Entry) {
 	t.Requests++
-	if e.Status >= 200 && e.Status < 300 {
+	switch {
+	case e.Status >= 200 && e.Status < 300:
 		t.Success++
-	} else {
+	case e.Status == 499:
+		// 499 是客户端先断开、网关随之取消上游请求（nginx 的惯例码）。
+		// 它既不是成功，也不是上游/账号的故障 —— 算进 Failed 会让「失败数」混进
+		// 用户自己按下的取消，运维照着这个数字会去追一个并不存在的故障。
+		// 单列一档；Requests 仍计入（请求确实发生过，只是没走完）。
+		t.Canceled++
+	default:
 		t.Failed++
 	}
 	t.PromptTokens += int64(e.PromptTokens)

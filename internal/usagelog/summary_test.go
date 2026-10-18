@@ -578,3 +578,32 @@ func TestSummaryScanIncompleteFlag(t *testing.T) {
 		t.Error("empty summary must not claim an incomplete scan")
 	}
 }
+
+// TestSummaryCounts499AsCanceled 499（客户端主动中断）单列一档：既不算成功也不算失败。
+// 恒等式必须是 Requests = Success + Failed + Canceled。
+//
+// 为什么值得单独钉一条：把 499 算进 Failed，控制台的「失败数」和侧栏「请求日志」的红点
+// 就会包含用户自己按下的取消 —— 运维照着这个数字去查上游，追的却是一个不存在的故障。
+func TestSummaryCounts499AsCanceled(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "usage.jsonl")
+	l := New(Config{Enabled: true, File: fp, MemorySize: 8})
+	writeEntries(t, l, 5, func(i int) Entry {
+		e := Entry{UID: "u1", Realm: "ai", Model: "glm-5.2", Status: 200, Time: time.Unix(int64(1700000000+i), 0)}
+		switch i {
+		case 2, 3:
+			e.Status = 499 // 客户端主动断开
+		case 4:
+			e.Status = 500 // 真失败
+		}
+		return e
+	})
+
+	s := l.Summary()
+	if s.Success != 2 || s.Failed != 1 || s.Canceled != 2 {
+		t.Fatalf("success=%d failed=%d canceled=%d want 2/1/2", s.Success, s.Failed, s.Canceled)
+	}
+	if s.Success+s.Failed+s.Canceled != s.Requests {
+		t.Errorf("success+failed+canceled=%d != requests=%d（恒等式被破坏）",
+			s.Success+s.Failed+s.Canceled, s.Requests)
+	}
+}

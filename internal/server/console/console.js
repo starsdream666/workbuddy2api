@@ -23,6 +23,9 @@ const state = {
   // 默认 50 条/页 —— 与 console.html 下拉里 selected 的那一项、以及 USAGE_PAGE_DEFAULT
   // 三处必须一致，否则首次渲染会和下拉显示对不上。
   usagePageSize: 50, usagePage: 1, usagePageCustom: "",
+  // 请求日志徽标的「已读」基线：进入日志页时把基线钉到当时的失败数，徽标只显示
+  // 进入之后**新增**的失败 —— 否则历史失败会永远挂在侧栏，数字不会自己消失。
+  navErrorBaseline: 0, navErrorsReset: false,
   // accountsAuto 自动刷新总开关（与 #accountsAuto 复选框同步，供多处读取）。
   accountsAuto: { checked: true },
   // usageAuto 用量面板的实时更新开关（与 #usageAuto 同步）：关掉只保留当前快照，不应用推送。
@@ -55,6 +58,9 @@ function switchView(focus = false) {
   if (hash === "mainContent") { $("mainContent").focus(); return; }
   const key = hash === "authorization" ? "credentials" : Object.hasOwn(views, hash) ? hash : "overview";
   ui.view = key;
+  // 切到日志页 → 标记「待对齐徽标基线」，由下一次 renderRecent 把基线钉到当时的失败数。
+  // 放在渲染里而不是这里，是因为此刻 state.usage 可能还是上一次的快照。
+  if (key === "usage") state.navErrorsReset = true;
   document.querySelectorAll("[data-page]").forEach(el => el.hidden = el.dataset.page !== key);
   document.querySelectorAll("[data-view]").forEach(el => { if (el.dataset.view === key) el.setAttribute("aria-current", "page"); else el.removeAttribute("aria-current"); });
   const [title, eyebrow, description, crumb] = views[key];
@@ -109,7 +115,13 @@ function renderDashboard() {
   const max=Math.max(1,...groups.map(g=>Number(g.totals?.requests)||0));
   $("modelRanking").innerHTML=groups.length?groups.map((g,i)=>'<div class="model-row"><div class="model-row-head"><span class="rank-number">'+String(i+1).padStart(2,"0")+'</span><b title="'+esc(g.key)+'">'+esc(g.key||"未知模型")+'</b><span class="model-number">'+esc(compact(g.totals?.requests))+' 次</span></div><div class="model-track"><span style="width:'+Math.max(0,(Number(g.totals?.requests)||0)/max*100)+'%"></span></div></div>').join(""):'<div class="empty"><strong>'+(valid?'暂无模型调用':'累计统计不可用')+'</strong>'+esc(valid?'产生请求后，可在这里比较模型使用量。':usageUnavailableReason(d)||'等待统计数据')+'</div>';
   const recentErrors=(d?.entries||[]).filter(ConsoleMetrics.failed).length;
-  $("navErrors").hidden=!recentErrors; $("navErrors").textContent=recentErrors; $("navErrors").title="保留日志中的失败请求数";
+  // 进过日志页即视为「已读」：把基线对齐到那一刻的失败数，徽标只提示**之后新增**的失败。
+  // 否则几天前一次失败会永远挂在侧栏上，数字永远不会自己消失（而它并不需要处理）。
+  // 499（客户端主动中断）已从 ConsoleMetrics.failed 里排除，因此不会把用户自己
+  // 按下的取消算进这个数字。
+  if (state.navErrorsReset) { state.navErrorBaseline = recentErrors; state.navErrorsReset = false; }
+  const pendingErrors = Math.max(0, recentErrors - (state.navErrorBaseline || 0));
+  $("navErrors").hidden=!pendingErrors; $("navErrors").textContent=pendingErrors; $("navErrors").title="进入请求日志后新增的失败请求数";
 }
 function renderHealth(totals) {
   const count=totals?.accounts||0, healthy=totals?.healthy||0, ratio=count?healthy/count*100:0;

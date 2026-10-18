@@ -2,7 +2,11 @@
 (function (root) {
   "use strict";
   const number = value => value === null || value === undefined || value === "" || !Number.isFinite(Number(value)) ? null : Number(value);
-  const failed = entry => { const code = number(entry.status); return code !== null && code > 0 && (code < 200 || code >= 300); };
+  // 499 = 客户端主动中断（客户端先断开，网关随之取消上游），不是上游/账号的故障。
+  // 单列一个谓词，且**从 failed 里排除**：否则控制台的「失败数」和「请求日志」标签
+  // 右侧的红色徽标会把用户自己按下的取消算进去，排查时被引向一个并不存在的问题。
+  const canceled = entry => number(entry.status) === 499;
+  const failed = entry => { const code = number(entry.status); return code !== null && code > 0 && code !== 499 && (code < 200 || code >= 300); };
   const successful = entry => { const code = number(entry.status); return code !== null && code >= 200 && code < 300; };
   function filterEntries(entries, filters = {}, now = Date.now()) {
     const query = String(filters.query || "").trim().toLowerCase();
@@ -83,7 +87,7 @@
     const cell=value => { let s=String(value ?? ""); if (/^[=+@\-\t\r\n]/.test(s)) s="'"+s; return '"'+s.replace(/"/g,'""')+'"'; };
     return "\uFEFF" + [columns.map(c=>cell(c[0])).join(","),...entries.map(e=>columns.map(c=>cell(e[c[1]])).join(","))].join("\r\n");
   }
-  const api={number,failed,successful,filterEntries,aggregate,timeline,metricValue,rangeStart,dayKey,dailyUsage,dailyTokens,csv};
+  const api={number,failed,successful,canceled,filterEntries,aggregate,timeline,metricValue,rangeStart,dayKey,dailyUsage,dailyTokens,csv};
   if (typeof module !== "undefined" && module.exports) module.exports=api;
   else root.ConsoleMetrics=api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

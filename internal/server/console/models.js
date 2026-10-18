@@ -9,7 +9,7 @@
   // refreshing 手动刷新在途标志：与自动加载的 loading 分开计数，
   // 因为两者守卫语义不同（自动加载可被静默跳过，手动点击必须有明确回执）。
   let loading = false, refreshing = false;
-  const view = { search: "", realm: "", kind: "", sort: "realm", dir: "asc" };
+  const view = { search: "", realm: "", kind: "", vendor: "", sort: "realm", dir: "asc" };
   const visible = () => state.authenticated && ui.view === "models" && !document.hidden;
 
   // 类型归一：媒体标签（image/video）单列，其余都是对话模型。
@@ -35,6 +35,7 @@
     return rows.filter(m => {
       if (view.realm && m.realm !== view.realm) return false;
       if (view.kind && kindOf(m) !== view.kind) return false;
+      if (view.vendor && (m.vendor || "") !== view.vendor) return false;
       if (q) {
         const hay = ((m.id || "") + " " + (m.name || "") + " " + (m.vendor || "")).toLowerCase();
         if (!hay.includes(q)) return false;
@@ -87,6 +88,19 @@
     select.innerHTML = '<option value="">全部产品线</option>' +
       realms.map(rn => '<option value="' + esc(rn) + '">' + esc(rn) + "</option>").join("");
     if (realms.includes(current)) select.value = current;
+  }
+
+  // 供应商筛选：形态与产品线筛选一致（下拉 + 「全部供应商」）。
+  // 数据源是上游下发的 m.vendor；空 vendor 的模型不进选项，但仍出现在「全部供应商」下
+  // —— 把它们塞进一个「未标注」选项会让筛选列表看起来比真实供应商多一档。
+  function renderVendorFilter(all) {
+    const vendors = [...new Set(all.map(m => m.vendor || "").filter(Boolean))].sort();
+    const select = $("modelsVendorFilter");
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = '<option value="">全部供应商</option>' +
+      vendors.map(v => '<option value="' + esc(v) + '">' + esc(v) + "</option>").join("");
+    if (vendors.includes(current)) select.value = current;
   }
 
   function renderTable() {
@@ -145,6 +159,7 @@
     const all = (state.models && state.models.data) || [];
     renderStats(all);
     renderRealmFilter(all);
+    renderVendorFilter(all);
     renderTable();
   }
 
@@ -188,6 +203,7 @@
   $("modelsSearch").addEventListener("input", () => { view.search = $("modelsSearch").value; renderTable(); });
   $("modelsRealmFilter").addEventListener("change", () => { view.realm = $("modelsRealmFilter").value; renderTable(); });
   $("modelsKindFilter").addEventListener("change", () => { view.kind = $("modelsKindFilter").value; renderTable(); });
+  $("modelsVendorFilter").addEventListener("change", () => { view.vendor = $("modelsVendorFilter").value; renderTable(); });
   // 表头排序：事件委托，重绘会重建 thead，逐个绑定会在重绘后失效。
   $("modelsTable").addEventListener("click", e => {
     const btn = e.target.closest("button[data-model-sort]");
