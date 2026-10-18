@@ -40,6 +40,14 @@ const (
 	// 在请求抵达业务层之前挡下并整页返回。全局性故障，与账号凭证 / 余额 / 限流状态无关，
 	// 不该算到单个账号头上（否则一次边缘抖动会把整池健康账号逐个喂进熔断器）。
 	ErrUpstreamGateway
+	// ErrChannelBlocked 上游渠道校验拦截（HTTP 400 + code 11128 + msg "request illegal"）。
+	// 判据是「这次调用没通过渠道校验 / 该账号已被上游标记」，既不是内容审核，也不是余额或限流。
+	// 实测口径（2026-10-18，自建实例做实号对照，同出口 IP / 同头族 / 同 body / 相邻分钟）：
+	// 被标记的号 13/13 命中 11128，健康号 4/4 直接 200 —— 判定落在**账号维度**，
+	// 换号能解、改 header 不能解（同一批实验里去/留浏览器头两组都是 5/5 被拦）。
+	// 处置：软冷却隔离该号（选号跳过、同会话下一跳自动换健康号），**不喂熔断器** ——
+	// 上游何时解除标记不可知（几分钟 ~ 次日），30m 起跳的硬封会盖住"可自愈"的号。
+	ErrChannelBlocked
 )
 
 func (k ErrKind) String() string {
@@ -66,6 +74,8 @@ func (k ErrKind) String() string {
 		return "image_invalid"
 	case ErrUpstreamGateway:
 		return "upstream_gateway"
+	case ErrChannelBlocked:
+		return "channel_blocked"
 	default:
 		return "none"
 	}
@@ -134,6 +144,26 @@ var contentBlockedMarkers = []string{
 	"blocked by security policy",
 	"unapproved channel",
 	"illegal api invocation",
+}
+
+// channelBlockedMarkers 渠道校验拦截关键词（大小写不敏感子串匹配）。
+//
+// 与 contentBlockedMarkers 的区分是**硬要求**：两者都可能是 HTTP 400 + code 11128，
+// 但处置逻辑相反 ——
+//   - 内容策略拦截（blocked by security policy …）：请求**内容**触雷，账号本身健康，
+//     换号没用，靠剥 system 降级重试；
+//   - 渠道校验拦截（request illegal …）：这次调用没通过上游的「像不像官方客户端」校验，
+//     内容无关，换到未被标记的账号即可通过（实测见 ErrChannelBlocked 注释）。
+//
+// 词表只收渠道校验专属措辞，**绝不收裸 "illegal"** —— 那会把同层
+// contentBlockedMarkers 的 "illegal api invocation" 一起吞掉，让内容审核误判成账号问题。
+var channelBlockedMarkers = []string{
+	"request illegal",
+	"channel verification", // displayTips: "This call failed channel verification ..."
+	"not sent from an official client",
+	"来自官方客户端",  // 中文 displayTips 原文
+	"渠道校验",      // 「这次调用没通过渠道校验」
+	"通路驗證",      // 繁体 displayTips 原文
 }
 
 // badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
@@ -252,6 +282,13 @@ func Classify(status int, body string) ErrKind {
 		for _, m := range contentBlockedMarkers {
 			if strings.Contains(lower, m) {
 				return ErrContentBlocked
+			}
+		}
+		// 渠道校验拦截（HTTP 400 + code 11128 + "request illegal"）：判在内容审核之后 ——
+		// 两者共用 11128，只有文案能区分，而内容审核的处置（剥 system 重试）对渠道校验无效。
+		for _, m := range channelBlockedMarkers {
+			if strings.Contains(lower, m) {
+				return ErrChannelBlocked
 			}
 		}
 		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：

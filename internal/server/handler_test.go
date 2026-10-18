@@ -1551,3 +1551,74 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
 	}
 }
+
+// TestChannelBlockedCoolsAccountWithoutBreaker 渠道校验拦截（400 + code 11128 +
+// "request illegal"）必须把该号软冷却隔离，但**不喂熔断器**。
+//
+// 线上依据（2026-10-18 自建实例实号对照，同出口 IP / 同头族 / 同 body / 相邻分钟）：
+// 被标记号 13/13 命中 11128，健康号 4/4 直接 200 —— 判定落在**账号维度**，换号能解。
+// 修复前这条路径掉进 ErrClient 的 default 分支（只换号不罚），于是被标记的号永远是
+// "健康"状态、被反复选中反复白打（线上单号 235 次）。
+func TestChannelBlockedCoolsAccountWithoutBreaker(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 熔断阈值 1：只要误喂一次熔断失败就会落下 BreakerUntil，断言因此足够灵敏。
+	p.SetBreaker(1, time.Hour, time.Hour)
+	h := NewHandler(Config{Pool: p, SoftCooldown: 10 * time.Minute})
+
+	h.applyErrorPolicyOn(p, "u1", upstream.ErrChannelBlocked,
+		`{"code":11128,"msg":"request illegal"}`, "glm-5.2")
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("status u1 missing")
+	}
+	if !st.Cooling {
+		t.Fatalf("account must be cooled after channel block: %+v", st)
+	}
+	if st.Reason != "11128 channel blocked" {
+		t.Errorf("reason=%q want %q（运维要能区分「渠道拦截」与「真故障」）", st.Reason, "11128 channel blocked")
+	}
+	if st.CoolRemaining <= 0 {
+		t.Errorf("cool_remaining_sec=%d want > 0", st.CoolRemaining)
+	}
+	if st.BreakerFails != 0 || !st.BreakerUntil.IsZero() {
+		t.Errorf("breaker must stay untouched: fails=%d until=%v", st.BreakerFails, st.BreakerUntil)
+	}
+	if st.Disabled {
+		t.Error("channel block must not disable the account（上游可能自己解除标记）")
+	}
+}
+
+// TestChannelBlockedReturnsDedicatedErrorCode 池里只剩被标记的号时，出口必须给出
+// upstream_channel_blocked，而不是把"号其实还活着、只是被上游标记了"说成
+// no_healthy_account / all accounts unavailable (cooling/disabled)。
+func TestChannelBlockedReturnsDedicatedErrorCode(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11128,"msg":"request illegal","requestId":"r1","displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。"}}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough", SoftCooldown: 10 * time.Minute})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != 503 {
+		t.Fatalf("code=%d want 503, body=%s", rec.Code, rec.Body)
+	}
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode error payload: %v (body=%s)", err, rec.Body)
+	}
+	if payload.Error.Code != "upstream_channel_blocked" {
+		t.Errorf("code=%q want upstream_channel_blocked (body=%s)", payload.Error.Code, rec.Body)
+	}
+	if strings.Contains(payload.Error.Message, "cooling/disabled") {
+		t.Errorf("message still claims cooling/disabled: %q", payload.Error.Message)
+	}
+}

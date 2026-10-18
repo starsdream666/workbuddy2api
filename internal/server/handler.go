@@ -1115,10 +1115,19 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request, protocol string) 
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
+	code := "no_healthy_account"
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
+		// 渠道校验拦截要单独说话：池子里其实还有健康号，只是这一轮撞上的号被上游判成
+		// "没通过渠道校验"（11128 request illegal）。沿用 cooling/disabled 的文案会把运维
+		// 引去查冷却和余额，而真实处置是「隔离被标记的号 / 换号重试」。
+		var ue *upstream.Error
+		if errors.As(lastErr, &ue) && ue.Kind == upstream.ErrChannelBlocked {
+			code = "upstream_channel_blocked"
+			msg = fmt.Sprintf("upstream channel verification rejected this call (400 code 11128 request illegal; the account looks flagged by upstream, not cooling): %s", ue.Msg)
+		}
 	}
-	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+	writeOpenAIError(w, http.StatusServiceUnavailable, code, msg)
 	st.status = http.StatusServiceUnavailable
 }
 
@@ -1191,6 +1200,15 @@ func (h *Handler) applyErrorPolicyOn(pl *pool.Pool, uid string, kind upstream.Er
 	case upstream.ErrContentBlocked:
 		// 内容策略拦截（误报）：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 模式由 chatCompletions 内降级重试处理；custom 模式本不会到此分支。
+	case upstream.ErrChannelBlocked:
+		// 渠道校验拦截（400 + code 11128 + "request illegal"）：判据落在**账号维度** ——
+		// 同出口 IP / 同头族 / 同 body 的对照实验里，被标记号 13/13 拦、健康号 4/4 过
+		// （见 upstream.ErrChannelBlocked 注释）。与 ErrContentBlocked 处置正好相反：
+		// 这里罚账号**才有用**，因为换到未标记的号就能通过。
+		// 软冷却隔离该号（base = soft_rate，持续命中按 softStreak 指数退避封顶），
+		// 但不喂熔断器 —— 上游可能几分钟到次日自愈，30m 起的硬封会盖住可恢复的号。
+		// 粘性绑定由轮转分支的 fail() 解绑，本会话下一跳自动落到健康号。
+		pl.CooldownChannelBlocked(uid, softCooldown, "11128 channel blocked")
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，

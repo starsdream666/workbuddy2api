@@ -41,6 +41,13 @@ func TestClassify(t *testing.T) {
 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
+		// 渠道校验拦截（HTTP 400 + code 11128 + "request illegal"）：与内容审核共用 11128，
+		// 只能靠文案区分，而两者处置相反。第一条是线上真实 body（2026-10-18 自建实例抓的，
+		// 含 displayMsg/displayTips 全字段）。后两条一并锁定：词表绝不能被宽化成裸 "illegal"，
+		// 否则上面 41 行那条 `Illegal API invocation from an unapproved channel` 会被吞成账号问题。
+		{400, `{"code":11128,"msg":"request illegal","requestId":"27d6f5e8-829b-49b6-9f0f-8fc6cef7f9d2","displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送"},"displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client. Please resend from the official client."},"actions":["EDIT_INPUT","SUBMIT_FEEDBACK"]}`, ErrChannelBlocked},
+		{400, `{"code":11128,"msg":"request illegal"}`, ErrChannelBlocked},
+		{400, `{"code":11128,"msg":"x","displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。"}}`, ErrChannelBlocked},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
