@@ -77,7 +77,7 @@ var cnProfile = Profile{
 	Platform:       "CLI",
 	Origin:         "https://www.codebuddy.cn",
 	Fingerprint:    FingerprintCLI,
-	CLIVersion:     "2.63.2",
+	CLIVersion:     "2.168.2",
 	DesktopVersion: "",
 }
 
@@ -94,8 +94,8 @@ var wbProfile = Profile{
 	Platform:       "workbuddy-ai",
 	Origin:         "https://www.workbuddy.ai",
 	Fingerprint:    FingerprintCLI,
-	CLIVersion:     "2.63.2",
-	DesktopVersion: "5.5.2",
+	CLIVersion:     "2.168.2",
+	DesktopVersion: "5.5.6",
 }
 
 // cbProfile CodeBuddy IDE 国际域线（workbuddy 的路线别名）。
@@ -112,8 +112,8 @@ var cbProfile = Profile{
 	Platform:       "workbuddy-ai",
 	Origin:         "https://www.codebuddy.ai",
 	Fingerprint:    FingerprintCLI,
-	CLIVersion:     "2.63.2",
-	DesktopVersion: "5.5.2",
+	CLIVersion:     "2.168.2",
+	DesktopVersion: "5.5.6",
 	AuthRealm:      WB,
 }
 
@@ -197,14 +197,31 @@ func NormalizeFingerprint(name string) (Fingerprint, bool) {
 }
 
 // ClientInfo 出站客户端身份（头部与 UA 的取值来源）。
+//
+// 取值依据（2026-10 核对，均为官方可复核来源）：
+//   - 桌面端：官方 WorkBuddy 桌面客户端 application-manifest.js —— UA 是单段
+//     `WorkBuddy/<ver>`；`X-Product` 是 **"SaaS"**（不是品牌名 WorkBuddy）；
+//     每次 chat 恒带 `X-Agent-Intent: craft` / `X-Agent-Purpose: conversation`，
+//     国际线另带 `X-Agent-Type: main`。
+//   - CLI：官方 npm 包 @tencent-ai/codebuddy-code 2.168.2 的头常量表 ——
+//     `X-Agent-Intent` 缺省 "craft"（meta["codebuddy.ai/mode"] 兜底值），
+//     `X-Agent-Runtime` 取值域是 [local-agent, cloud-agent, agent-agent]，
+//     `X-IDE-Type`/`X-IDE-Name` 为 CLI 自身。
+//   - 两者 `X-Product` 同为 "SaaS"：上游按它做「使用端」归因，发品牌名会被归到
+//     未知客户端（实测送 `WorkBuddy` 有 403 code 11140 的风控记录）。
 type ClientInfo struct {
 	UserAgent string
-	// Product X-Product 头取值（CLI 风格为 SaaS，桌面风格为 WorkBuddy）。
+	// Product X-Product 头取值（官方两个客户端都是 "SaaS"）。
 	Product string
-	// IDEType/IDEName/IDEVersion 仅桌面指纹非空（X-IDE-* 三头）。
+	// IDEType/IDEName/IDEVersion X-IDE-* 三头：桌面端 = WorkBuddy/<ver>，CLI = CLI/<ver>。
 	IDEType    string
 	IDEName    string
 	IDEVersion string
+	// Agent* 官方 agent 头族，桌面端每条 chat 都带；空 = 不发该头。
+	AgentIntent  string // X-Agent-Intent
+	AgentPurpose string // X-Agent-Purpose
+	AgentType    string // X-Agent-Type
+	AgentRuntime string // X-Agent-Runtime
 }
 
 // ClientInfo 按指纹风格构造身份；version 为空时回落 profile 内置版本。
@@ -215,18 +232,26 @@ func (p Profile) ClientInfo(fp Fingerprint, version string) ClientInfo {
 			v = p.DesktopVersion
 		}
 		return ClientInfo{
-			UserAgent:  "WorkBuddy/" + v,
-			Product:    "WorkBuddy",
-			IDEType:    "WorkBuddy",
-			IDEName:    "WorkBuddy",
-			IDEVersion: v,
+			UserAgent:    "WorkBuddy/" + v,
+			Product:      "SaaS",
+			IDEType:      "WorkBuddy",
+			IDEName:      "WorkBuddy",
+			IDEVersion:   v,
+			AgentIntent:  "craft",
+			AgentPurpose: "conversation",
+			AgentType:    "main",
 		}
 	}
 	if v == "" {
 		v = p.CLIVersion
 	}
 	return ClientInfo{
-		UserAgent: "CLI/" + v + " CodeBuddy/" + v,
-		Product:   "SaaS",
+		UserAgent:    "CLI/" + v + " CodeBuddy/" + v,
+		Product:      "SaaS",
+		IDEType:      "CLI",
+		IDEName:      "CLI",
+		IDEVersion:   v,
+		AgentIntent:  "craft",
+		AgentRuntime: "local-agent",
 	}
 }

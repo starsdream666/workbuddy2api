@@ -55,8 +55,9 @@ func TestFetchModelsAIUsesProductConfig(t *testing.T) {
 		t.Errorf("path=%q want /v3/config", gotPath)
 	}
 	// 取配置的身份必须与出站身份一致：桌面指纹才拿到桌面那份名单。
-	if gotProduct != "WorkBuddy" || gotIDE != "WorkBuddy" {
-		t.Errorf("身份头 X-Product=%q X-IDE-Type=%q want WorkBuddy", gotProduct, gotIDE)
+	// 身份口径按官方 application-manifest.js：X-Product 是 SaaS，X-IDE-Type 才是品牌名。
+	if gotProduct != "SaaS" || gotIDE != "WorkBuddy" {
+		t.Errorf("身份头 X-Product=%q X-IDE-Type=%q want SaaS/WorkBuddy", gotProduct, gotIDE)
 	}
 	ids := make([]string, 0, len(models))
 	for _, m := range models {
@@ -106,8 +107,9 @@ func TestFetchModelsAICLIFingerprintIdentity(t *testing.T) {
 	if _, err := c.FetchModels(a); err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	if gotProduct != "SaaS" || gotIDE != "" {
-		t.Errorf("cli 指纹身份头 X-Product=%q X-IDE-Type=%q", gotProduct, gotIDE)
+	// CLI 指纹现在也自报 X-IDE-*（官方 CLI 2.168.2 就是 CLI/CLI/<ver>）。
+	if gotProduct != "SaaS" || gotIDE != "CLI" {
+		t.Errorf("cli 指纹身份头 X-Product=%q X-IDE-Type=%q want SaaS/CLI", gotProduct, gotIDE)
 	}
 }
 

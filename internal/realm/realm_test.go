@@ -60,14 +60,20 @@ func TestCNProfileMatchesLegacyConstants(t *testing.T) {
 		t.Errorf("Origin=%q", p.Origin)
 	}
 	ci := p.ClientInfo(p.Fingerprint, "")
-	if ci.UserAgent != "CLI/2.63.2 CodeBuddy/2.63.2" {
+	if ci.UserAgent != "CLI/2.168.2 CodeBuddy/2.168.2" {
 		t.Errorf("UA=%q", ci.UserAgent)
 	}
 	if ci.Product != "SaaS" {
 		t.Errorf("Product=%q", ci.Product)
 	}
-	if ci.IDEType != "" || ci.IDEName != "" || ci.IDEVersion != "" {
-		t.Errorf("CLI 指纹不该带 X-IDE-* : %+v", ci)
+	// 官方 CLI（@tencent-ai/codebuddy-code 2.168.2）自报 X-IDE-Type/Name = CLI，
+	// 不再是"裸 UA 不带任何 IDE 头"。
+	if ci.IDEType != "CLI" || ci.IDEName != "CLI" || ci.IDEVersion != p.CLIVersion {
+		t.Errorf("CLI 指纹的 X-IDE-* 应为 CLI/CLI/<ver>: %+v", ci)
+	}
+	// agent 头族：官方 CLI 缺省 craft，runtime 取值域里 local-agent 是本地会话。
+	if ci.AgentIntent != "craft" || ci.AgentRuntime != "local-agent" {
+		t.Errorf("CLI agent 头族=%+v", ci)
 	}
 }
 
@@ -124,8 +130,14 @@ func TestClientInfoDesktopFingerprint(t *testing.T) {
 	if ci.UserAgent != "WorkBuddy/"+p.DesktopVersion {
 		t.Errorf("UA=%q want WorkBuddy/%s", ci.UserAgent, p.DesktopVersion)
 	}
-	if ci.Product != "WorkBuddy" || ci.IDEType != "WorkBuddy" || ci.IDEName != "WorkBuddy" {
+	// 官方桌面客户端 application-manifest.js 的 X-Product 是 "SaaS"（不是品牌名
+	// WorkBuddy）：上游按它做「使用端」归因，发品牌名会被归到未知客户端。
+	if ci.Product != "SaaS" || ci.IDEType != "WorkBuddy" || ci.IDEName != "WorkBuddy" {
 		t.Errorf("desktop identity=%+v", ci)
+	}
+	// 桌面端每条 chat 恒带 agent 头族：craft / conversation / main。
+	if ci.AgentIntent != "craft" || ci.AgentPurpose != "conversation" || ci.AgentType != "main" {
+		t.Errorf("desktop agent 头族=%+v", ci)
 	}
 	if ci.IDEVersion != p.DesktopVersion {
 		t.Errorf("IDEVersion=%q want %q", ci.IDEVersion, p.DesktopVersion)

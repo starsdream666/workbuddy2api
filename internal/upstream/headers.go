@@ -13,7 +13,7 @@ import (
 const (
 	// clientUA CN 线默认出站 UA（= realm.Defaults()[cn] + cli 指纹的等价字面量）。
 	// 保持常量以便测试与文档引用；实际取值走 profile + 指纹解析。
-	clientUA        = "CLI/2.63.2 CodeBuddy/2.63.2"
+	clientUA        = "CLI/2.168.2 CodeBuddy/2.168.2"
 	originRefererCN = "https://www.codebuddy.cn"
 )
 
@@ -159,6 +159,11 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// X-CodeBuddy-Request 是官方定义的**安全请求头**：值固定 "1"，除豁免路径外
+	// 所有 API 请求都必须携带（官方 SDK 的 CustomRequestHeader schema 原文：
+	// 「安全请求头，值固定为 `1`。所有 API 请求（除豁免路径外）必须携带」）。
+	// 本项目此前完全不发它 —— 这是最直白的"非官方来源"缺口。
+	req.Header.Set("X-CodeBuddy-Request", "1")
 	origin := c.profileOf(a).Origin
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
@@ -180,6 +185,30 @@ func (c *Client) applyClientIdentity(req *http.Request, a *auth.Auth) {
 	}
 	if ci.IDEVersion != "" {
 		req.Header.Set("X-IDE-Version", ci.IDEVersion)
+	}
+}
+
+// applyAgentIdentity 附加官方 agent 头族（X-Agent-Intent / Purpose / Type / Runtime）。
+//
+// 依据：官方 WorkBuddy 桌面客户端 application-manifest.js 在每条 chat 上都带
+// X-Agent-Intent: craft + X-Agent-Purpose: conversation（国际线另带 X-Agent-Type: main）；
+// 官方 CLI 包 2.168.2 的头常量表定义同一族，X-Agent-Runtime 取值域
+// [local-agent, cloud-agent, agent-agent]。缺少这一族时上游把请求归到"没有客户端"，
+// 官网「使用端」列显示为空 —— 这是可见的身份缺口，不是猜测。
+// 字段为空就不发（宁可少发，也不伪造自己没有依据的取值）。
+func (c *Client) applyAgentIdentity(req *http.Request, a *auth.Auth) {
+	ci := c.clientInfoOf(a)
+	if ci.AgentIntent != "" {
+		req.Header.Set("X-Agent-Intent", ci.AgentIntent)
+	}
+	if ci.AgentPurpose != "" {
+		req.Header.Set("X-Agent-Purpose", ci.AgentPurpose)
+	}
+	if ci.AgentType != "" {
+		req.Header.Set("X-Agent-Type", ci.AgentType)
+	}
+	if ci.AgentRuntime != "" {
+		req.Header.Set("X-Agent-Runtime", ci.AgentRuntime)
 	}
 }
 
@@ -210,6 +239,10 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	c.applyClientIdentity(req, a)
+	// chat 的 Accept 按官方声明：官方 chat 请求带 text/event-stream（不是 */*），
+	// 缺了会显得像个通用 OpenAI 客户端而不是 WorkBuddy 自己。
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	c.applyAgentIdentity(req, a)
 }
 
 // BillingHeaders billing 接口请求头。

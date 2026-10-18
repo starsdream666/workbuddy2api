@@ -312,7 +312,7 @@ go run ./cmd/importauth -dry-run   # 只打印将要写入的内容，不落盘
 - 服务端按**出站指纹**返回不同版本的配置，所以"看到的列表"与"出站身份"绑定：桌面指纹（`workbuddy-desktop`）拿到桌面端 UI 那份，cli 指纹拿到 CLI 口径（2026-10 实测：桌面口径 22 个模型、cli agent 21 个 id，含 `deepseek-v4.1-flash` / `hy3` 等免费档）：
 
 ```json
-"upstream": { "realm_overrides": { "workbuddy": { "fingerprint": "workbuddy-desktop", "client_version": "5.5.2" } } }
+"upstream": { "realm_overrides": { "workbuddy": { "fingerprint": "workbuddy-desktop", "client_version": "5.5.6" } } }
 ```
 
 > 注：网关对 `model` 字段是**透传**的 —— 列表只影响客户端选择器里能看到什么；任何不在列表里的 id（含 `enhance-1.0` / `nes-1.2` 这类内部别名）直接填名字请求，网关照样发给上游。
@@ -320,19 +320,34 @@ go run ./cmd/importauth -dry-run   # 只打印将要写入的内容，不落盘
 
 ### 出站指纹（可切换）
 
-上游按出站 UA / `X-Product` 做「使用端」归因。默认两条线都用官方 CLI 指纹（与改造前逐字一致）；
+上游按出站 UA / `X-Product` / `X-IDE-*` 做「使用端」归因。身份口径按官方客户端实证对齐
+（2026-10 核对官方 CLI `@tencent-ai/codebuddy-code` 2.168.2 的头常量表，与官方 WorkBuddy
+桌面端 `application-manifest.js` 的出站头快照）：
+
+| 指纹 | User-Agent | X-Product | X-IDE-Type/Name | Agent 头族 |
+|---|---|---|---|---|
+| `cli`（默认） | `CLI/2.168.2 CodeBuddy/2.168.2` | `SaaS` | `CLI` / `CLI` | `X-Agent-Intent: craft`、`X-Agent-Runtime: local-agent` |
+| `workbuddy-desktop` | `WorkBuddy/5.5.6` | `SaaS` | `WorkBuddy` / `WorkBuddy` | `X-Agent-Intent: craft`、`X-Agent-Purpose: conversation`、`X-Agent-Type: main` |
+
+两条指纹共同携带的固定头：`X-CodeBuddy-Request: 1`（官方定义的**安全请求头**，「所有
+API 请求（除豁免路径外）必须携带」）、`X-Requested-With: XMLHttpRequest`、同域
+`Origin`/`Referer`；chat 另带 `Accept: application/json, text/event-stream`。
+
+`X-Product` 恒为 `SaaS`（**不是**品牌名 WorkBuddy）：官方两个客户端都这么发，上游按它做
+「使用端」归因，发品牌名会被归到未知客户端。
+
 需要让 workbuddy 线被识别为 **WorkBuddy 桌面客户端**时：
 
 ```json
 "upstream": {
   "realm_overrides": {
-    "workbuddy": { "fingerprint": "workbuddy-desktop", "client_version": "5.5.2" }
+    "workbuddy": { "fingerprint": "workbuddy-desktop", "client_version": "5.5.6" }
   }
 }
 ```
 
-切换后该线出站变为 `User-Agent: WorkBuddy/<version>` + `X-Product: WorkBuddy`
-+ `X-IDE-Type/X-IDE-Name: WorkBuddy` + `X-IDE-Version: <version>`，与桌面端 `AuthService` 的出站头一致。
+注：对齐请求形状只解决「身份/归因/版本闸门」这一层。**被上游标记的账号不会因此解封** ——
+实测同一形状下被标记号仍 13/13 命中 11128，见[错误分类与账号处置](#错误分类与账号处置)。
 
 ## 额度冻结（余额为 0 的账号不再空转）
 
@@ -580,8 +595,8 @@ docker compose -f docker-compose.yml -f docker-compose.settings.yml up -d --buil
 | `upstream.user_agent` | 空 | 全局出站 User-Agent 覆盖（空 = 按 realm 指纹解析）。优先级高于 realm 级配置 |
 | `upstream.realm` | `cn` | 未标注 realm 的账号归属，同时是未显式指定 realm 的请求默认路由（`cn` / `workbuddy` / `codebuddy`；旧名 `ai` 等价于 `workbuddy`） |
 | `upstream.realm_overrides.<realm>.chat_base` / `billing_base` / `platform` / `origin` | 空 | 覆盖该 realm 的端点档案（空 = 内置：cn → copilot.tencent.com / www.codebuddy.cn，workbuddy → www.workbuddy.ai，codebuddy → www.codebuddy.ai 且 platform 沿用 `workbuddy-ai`；要按 IDE 归因可覆盖成 `ide`） |
-| `upstream.realm_overrides.<realm>.fingerprint` | 空 | 该 realm 的出站指纹：`cli`（默认，`CLI/<ver> CodeBuddy/<ver>` + `X-Product: SaaS`）或 `workbuddy-desktop`（`WorkBuddy/<ver>` + `X-Product: WorkBuddy` + `X-IDE-*`） |
-| `upstream.realm_overrides.<realm>.client_version` | 空 | 指纹里的版本号（`workbuddy-desktop` 默认取桌面端档案 5.5.2） |
+| `upstream.realm_overrides.<realm>.fingerprint` | 空 | 该 realm 的出站指纹：`cli`（默认，`CLI/<ver> CodeBuddy/<ver>` + `X-Product: SaaS` + `X-IDE-*: CLI`）或 `workbuddy-desktop`（`WorkBuddy/<ver>` + `X-Product: SaaS` + `X-IDE-*: WorkBuddy` + `X-Agent-Purpose/Type`） |
+| `upstream.realm_overrides.<realm>.client_version` | 空 | 指纹里的版本号（`workbuddy-desktop` 默认取桌面端档案 5.5.6） |
 | `upstream.realm_overrides.<realm>.user_agent` | 空 | 该 realm 的 UA 直接覆盖 |
 | `realms.<realm>.api_key` | 空（已退役） | 仅首次迁移旧产品线 Key，之后通过管理页面修改权限或吊销 |
 | `realms.<realm>.auth_realm` | 空 | **路线别名**用：该路线的凭证来源线（例 `codebuddy` → `workbuddy`）。配了即启用该路线，复用来源线账号池；`cn` 不可作为来源线 |
@@ -1030,7 +1045,7 @@ curl -sN http://localhost:7863/v1/messages \
 上表为 **cn 线**；`workbuddy` 线的路径同构（`/v2/chat/completions`、`/v2/billing/meter/*`、`/v2/activity/growth/*`），
 host 换成 `www.workbuddy.ai`（模型列表接口除外，见「产品线（realm）」与「模型列表：以服务端下发为准」）。
 
-出站请求默认携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可按 realm 指纹或 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。
+出站请求默认携带 `CLI/2.168.2 CodeBuddy/2.168.2` UA（可按 realm 指纹或 `upstream.user_agent` 覆盖）；所有 API 请求带 `X-CodeBuddy-Request: 1`（官方定义的安全请求头），chat 另带账号头（`X-User-Id` 等）与 agent 头族（`X-Agent-Intent` / `-Purpose` / `-Type` / `-Runtime`），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。
 
 ## 请求级日志
 
@@ -1338,7 +1353,7 @@ host 换成 `www.workbuddy.ai`（模型列表接口除外，见「产品线（re
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
-官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `CLI/2.63.2 CodeBuddy/2.63.2` 现状（指纹净化考虑，可配而非改死）。
+官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认按 realm 指纹解析（cli 现为 `CLI/2.168.2 CodeBuddy/2.168.2`，桌面端 `WorkBuddy/5.5.6`）。
 
 ## 关键断言 ↔ 代码出处
 
@@ -1354,7 +1369,7 @@ host 换成 `www.workbuddy.ai`（模型列表接口除外，见「产品线（re
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
 | `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
-| 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
+| 出站 UA 覆盖（空 = 按 realm 指纹解析：cli 现为 `CLI/2.168.2 CodeBuddy/2.168.2`，桌面端 `WorkBuddy/5.5.6`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
 | session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |
 | `ReviveDisabled` 人工复活 | `internal/pool/pool.go:951` |
 | 人工停用层 `manual_disabled`（与系统层正交） | `internal/pool/manual.go`（`SetManualDisabled`）、`state.json` 字段 `manual_disabled` |

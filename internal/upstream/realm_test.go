@@ -52,35 +52,35 @@ func TestChatRealmDispatchBaseAndFingerprint(t *testing.T) {
 		wantUA  string
 		wantOrg string
 		wantPrd string
-		wantIDE bool
+		wantIDEName string
 	}{
 		{
 			name:    "cn_default_cli",
 			acct:    &auth.Auth{AccessToken: "at", UID: "u1"},
 			wantURL: "https://copilot.tencent.com/v2/chat/completions",
-			wantUA:  "CLI/2.63.2 CodeBuddy/2.63.2",
+			wantUA:  "CLI/2.168.2 CodeBuddy/2.168.2",
 			wantOrg: "https://www.codebuddy.cn",
 			wantPrd: "SaaS",
-			wantIDE: false,
+			wantIDEName: "CLI",
 		},
 		{
 			name:    "workbuddy_cli",
 			acct:    &auth.Auth{AccessToken: "at", UID: "u1", Realm: realm.WB, Domain: "www.workbuddy.ai"},
 			wantURL: "https://www.workbuddy.ai/v2/chat/completions",
-			wantUA:  "CLI/2.63.2 CodeBuddy/2.63.2",
+			wantUA:  "CLI/2.168.2 CodeBuddy/2.168.2",
 			wantOrg: "https://www.workbuddy.ai",
 			wantPrd: "SaaS",
-			wantIDE: false,
+			wantIDEName: "CLI",
 		},
 		{
 			name:    "workbuddy_desktop_fingerprint",
 			acct:    &auth.Auth{AccessToken: "at", UID: "u1", Realm: realm.WB, Domain: "www.workbuddy.ai"},
 			fp:      map[string]realm.Fingerprint{realm.WB: realm.FingerprintDesktop},
 			wantURL: "https://www.workbuddy.ai/v2/chat/completions",
-			wantUA:  "WorkBuddy/5.5.2",
+			wantUA:  "WorkBuddy/5.5.6",
 			wantOrg: "https://www.workbuddy.ai",
-			wantPrd: "WorkBuddy",
-			wantIDE: true,
+			wantPrd: "SaaS",
+			wantIDEName: "WorkBuddy",
 		},
 	}
 	for _, tc := range cases {
@@ -111,12 +111,12 @@ func TestChatRealmDispatchBaseAndFingerprint(t *testing.T) {
 			if cap.product != tc.wantPrd {
 				t.Errorf("X-Product=%q want %q", cap.product, tc.wantPrd)
 			}
-			if tc.wantIDE {
-				if cap.ideType != "WorkBuddy" || cap.ideName != "WorkBuddy" || cap.ideVer != "5.5.2" {
-					t.Errorf("X-IDE-* = %q/%q/%q", cap.ideType, cap.ideName, cap.ideVer)
-				}
-			} else if cap.ideType != "" || cap.ideName != "" || cap.ideVer != "" {
-				t.Errorf("cli 指纹不该带 X-IDE-*: %q/%q/%q", cap.ideType, cap.ideName, cap.ideVer)
+			// X-IDE-* 现在两条指纹都发：官方 CLI 2.168.2 自报 CLI，桌面端自报 WorkBuddy。
+			if cap.ideType != tc.wantIDEName || cap.ideName != tc.wantIDEName {
+				t.Errorf("X-IDE-Type/Name = %q/%q want %q", cap.ideType, cap.ideName, tc.wantIDEName)
+			}
+			if cap.ideVer == "" {
+				t.Error("X-IDE-Version 不该为空（官方两个客户端都带版本）")
 			}
 			if tc.acct.Realm == realm.WB && cap.domain != "www.workbuddy.ai" {
 				t.Errorf("X-Domain=%q want www.workbuddy.ai", cap.domain)
@@ -153,8 +153,8 @@ func TestBillingBaseRealmDispatch(t *testing.T) {
 	if _, err := c2.UserResource(a); err != nil {
 		t.Fatalf("user resource: %v", err)
 	}
-	if cap2.ua != "WorkBuddy/5.5.2" {
-		t.Errorf("billing UA=%q want WorkBuddy/5.5.2", cap2.ua)
+	if cap2.ua != "WorkBuddy/5.5.6" {
+		t.Errorf("billing UA=%q want WorkBuddy/5.5.6", cap2.ua)
 	}
 }
 
