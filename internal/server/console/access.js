@@ -82,7 +82,7 @@
     try {
       const data = await api("/admin/api/keys"); keys = data.keys;
       $("keysNotice").textContent = "完整 Key 仅创建时显示一次。修改权限、停用或吊销后，对新请求立即生效。";
-      $("keysList").innerHTML = keys.length ? `<div class="table-wrap" tabindex="0" role="region" aria-label="访问密钥列表"><table><thead><tr><th>名称 / 标识</th><th>状态</th><th>允许渠道</th><th>默认渠道</th><th>有效期</th><th>请求上限</th><th>操作</th></tr></thead><tbody>${keys.map(key => `<tr><td><b>${esc(key.name)}</b><div class="hint mono">${esc(key.prefix)}</div></td><td>${keyState(key)}</td><td>${esc(key.channels.join("、"))}</td><td>${esc(key.default_channel)}</td><td>${key.expires_at ? esc(fmtTime(key.expires_at)) : "长期有效"}</td><td>${key.rpm ? esc(key.rpm) + " / 分钟" : "不限"}</td><td>${key.revoked_at ? "—" : `<button data-key-edit="${esc(key.id)}">编辑</button> <button data-key-toggle="${esc(key.id)}">${key.enabled ? "停用" : "启用"}</button> <button class="danger" data-key-revoke="${esc(key.id)}">吊销</button>`}</td></tr>`).join("")}</tbody></table></div>` : '<div class="empty"><strong>尚无访问密钥</strong>创建 Key 后，客户端才可调用 API。</div>';
+      $("keysList").innerHTML = keys.length ? `<div class="table-wrap" tabindex="0" role="region" aria-label="访问密钥列表"><table><thead><tr><th>名称 / 标识</th><th>状态</th><th>允许渠道</th><th>默认渠道</th><th>有效期</th><th>请求上限</th><th>操作</th></tr></thead><tbody>${keys.map(key => `<tr><td><b>${esc(key.name)}</b><div class="hint mono">${esc(key.prefix)}</div></td><td>${keyState(key)}</td><td>${esc(key.channels.join("、"))}</td><td>${esc(key.default_channel)}</td><td>${key.expires_at ? esc(fmtTime(key.expires_at)) : "长期有效"}</td><td>${key.rpm ? esc(key.rpm) + " / 分钟" : "不限"}</td><td>${(key.revoked_at ? "" : `<button data-key-edit="${esc(key.id)}">编辑</button> <button data-key-toggle="${esc(key.id)}">${key.enabled ? "停用" : "启用"}</button> <button class="danger" data-key-revoke="${esc(key.id)}">吊销</button> `)}<button data-key-copy="${esc(key.id)}" title="复制密钥前缀（完整 Key 仅在创建时显示一次）">复制</button> <button class="danger" data-key-purge="${esc(key.id)}" title="从 access.json 彻底删除，不可恢复">删除</button></td></tr>`).join("")}</tbody></table></div>` : '<div class="empty"><strong>尚无访问密钥</strong>创建 Key 后，客户端才可调用 API。</div>';
       $("keyChannels").innerHTML = data.channels.map(name => `<label><input type="checkbox" value="${esc(name)}"> ${esc(name)}${data.active_channels.includes(name) ? "" : "（未启用）"}</label>`).join("");
       $("keyNew").disabled = false;
     } catch (error) { $("keysNotice").textContent = "读取失败：" + error.message; }
@@ -123,9 +123,20 @@
   $("issuedKeyDialog").addEventListener("close", () => { $("issuedKey").value = ""; });
   $("keysList").addEventListener("click", async event => {
     const button = event.target.closest("button"); if (!button || button.disabled) return;
-    const key = keys.find(key => key.id === (button.dataset.keyEdit || button.dataset.keyToggle || button.dataset.keyRevoke)); if (!key) return;
+    const key = keys.find(key => key.id === (button.dataset.keyEdit || button.dataset.keyToggle || button.dataset.keyRevoke || button.dataset.keyCopy || button.dataset.keyPurge)); if (!key) return;
     if (button.dataset.keyEdit) { editKey(key); return; }
     if (button.dataset.keyRevoke) { revoking = key; $("keyRevokeName").textContent = key.name; $("keyRevokeError").textContent = ""; $("keyRevokeDialog").showModal(); return; }
+    // 复制的是「前缀」：完整 Key 只在创建时回显一次（服务端只存 hash，无法再取出）。
+    // 提示文案写明这一点，免得用户以为复制到了可以直接用的 Key。
+    if (button.dataset.keyCopy) { copyText(key.prefix, `已复制前缀 ${key.prefix} —— 完整 Key 仅在创建时显示一次`); return; }
+    // 彻底删除（不可恢复）：与「吊销」软删分开，必须二次确认。
+    if (button.dataset.keyPurge) {
+      if (!window.confirm(`确认彻底删除密钥「${key.name}」？\n\n这会把它从认证数据里移除，无法恢复；若只想让它失效但保留记录，请改用「吊销」。`)) return;
+      button.disabled = true;
+      try { await api("/admin/api/keys/"+encodeURIComponent(key.id)+"/purge",{method:"DELETE"}); await loadKeys(); }
+      catch (error) { $("keysNotice").textContent = "删除失败：" + error.message; button.disabled = false; }
+      return;
+    }
     button.disabled = true;
     try { await api("/admin/api/keys/"+encodeURIComponent(key.id),{method:"PATCH",body:JSON.stringify({...policy(key),enabled:!key.enabled})}); await loadKeys(); }
     catch (error) { $("keysNotice").textContent = error.message; button.disabled = false; }

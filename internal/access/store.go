@@ -513,6 +513,38 @@ func (s *Store) Revoke(id string) error {
 	}
 	return ErrNotFound
 }
+// Delete 从存储中**彻底移除**一条密钥（硬删，不是吊销）。
+//
+// 与 Revoke 的分工：
+//   - Revoke 软删：置 RevokedAt + Enabled=false，记录留在列表里，保留审计痕迹；
+//   - Delete 硬删：从落盘状态里抹掉这条记录，Key 立即从列表消失、**不可回滚**。
+//
+// 已吊销的密钥会一直留在列表里，Delete 就是清理它们的出口。因为不可撤销，
+// HTTP 层要求调用方走 /purge 子路径显式表达意图 —— 不把 DELETE /keys/{id}
+// （既有语义是吊销）的行为改掉，避免老调用方重试时误删。
+func (s *Store) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.data
+	next.Keys = make([]storedKey, 0, len(s.data.Keys))
+	found := false
+	for _, key := range s.data.Keys {
+		if key.ID == id {
+			found = true
+			continue
+		}
+		next.Keys = append(next.Keys, key)
+	}
+	if !found {
+		return ErrNotFound
+	}
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
+	delete(s.rates, id)
+	return nil
+}
+
 func (s *Store) lookupLocked(token string) (Key, error) {
 	if token == "" || len(token) > 4096 {
 		return Key{}, ErrInvalidKey

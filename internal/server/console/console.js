@@ -20,7 +20,9 @@ const state = {
   // 只放页面状态——数据永远从 state.usage.entries 现取，条数上限由后端 limit 决定。
   // pageSize 是**用户意图**（可能是下拉值来的数字，也可能是自定义输入的原值），
   // 渲染时统一经 usagePageSize() 归一化，避免把"未填的自定义值"写死进状态。
-  usagePageSize: "all", usagePage: 1, usagePageCustom: "",
+  // 默认 50 条/页 —— 与 console.html 下拉里 selected 的那一项、以及 USAGE_PAGE_DEFAULT
+  // 三处必须一致，否则首次渲染会和下拉显示对不上。
+  usagePageSize: 50, usagePage: 1, usagePageCustom: "",
   // accountsAuto 自动刷新总开关（与 #accountsAuto 复选框同步，供多处读取）。
   accountsAuto: { checked: true },
   // usageAuto 用量面板的实时更新开关（与 #usageAuto 同步）：关掉只保留当前快照，不应用推送。
@@ -1000,7 +1002,7 @@ async function toggleAccount(index) {
 }
 // ── 使用日志（04）────────────────────────────────────────────────────────────
 // The API returns all retained history. Pagination only controls presentation.
-const USAGE_PAGE_DEFAULT = 20;
+const USAGE_PAGE_DEFAULT = 50;
 function usagePageSize() {
   if (state.usagePageSize === "all") return Math.max(1,state.usage?.entries?.length || 0);
   const n = usageInt(state.usagePageSize);

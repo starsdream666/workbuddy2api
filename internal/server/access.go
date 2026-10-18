@@ -111,6 +111,7 @@ func (h *Handler) registerAccess() {
 	h.mux.HandleFunc("POST /admin/api/keys", h.withAdminAuth(h.adminCreateKey))
 	h.mux.HandleFunc("PATCH /admin/api/keys/{id}", h.withAdminAuth(h.adminUpdateKey))
 	h.mux.HandleFunc("DELETE /admin/api/keys/{id}", h.withAdminAuth(h.adminRevokeKey))
+	h.mux.HandleFunc("DELETE /admin/api/keys/{id}/purge", h.withAdminAuth(h.adminPurgeKey))
 }
 func (h *Handler) adminSession(w http.ResponseWriter, r *http.Request) {
 	sess, ok := h.cfg.Access.Session(sessionToken(r))
@@ -243,6 +244,24 @@ func (h *Handler) adminRevokeKey(w http.ResponseWriter, r *http.Request) {
 			status = 404
 		}
 		writeJSON(w, status, map[string]any{"error": "吊销失败，请确认密钥存在且认证数据可写"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// adminPurgeKey 彻底删除一条密钥（硬删）。DELETE /admin/api/keys/{id}/purge
+//
+// 与 adminRevokeKey（软删、保留记录）分工不同：这条路径把记录从 access.json 里
+// 抹掉，列表里立即消失且不可回滚。走独立子路径而不复用 DELETE /keys/{id}，
+// 是为了让「吊销」和「删除」在 HTTP 语义上也分得开 —— 老调用方重试 DELETE
+// 仍只会吊销，不会因为一次重试把密钥删掉。
+func (h *Handler) adminPurgeKey(w http.ResponseWriter, r *http.Request) {
+	if err := h.cfg.Access.Delete(r.PathValue("id")); err != nil {
+		status := 500
+		if errors.Is(err, access.ErrNotFound) {
+			status = 404
+		}
+		writeJSON(w, status, map[string]any{"error": "删除失败，请确认密钥存在且认证数据可写"})
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
