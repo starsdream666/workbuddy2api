@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-<img alt="Version" src="https://img.shields.io/badge/version-v1.3.0-119c76?style=flat-square">
+<img alt="Version" src="https://img.shields.io/badge/version-v1.4.0-119c76?style=flat-square">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Docker_Compose-2496ED?logo=docker&logoColor=white&style=flat-square">
@@ -34,6 +34,41 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 CodeBuddy 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
 ## 核心能力
+
+### v1.4.0：控制台可用性（密钥管理、日志与统计口径）
+
+五项改动，都在控制台与统计口径上：
+
+**访问密钥**
+
+- 每行新增**复制**按钮：复制密钥前缀（`sk-xxxxxxxx`）。完整 Key 只在创建时回显一次 ——
+  服务端只存 hash，取不回明文，所以文案写的是「前缀」而不是「Key」。
+- 每行新增**删除**按钮（`DELETE /admin/api/keys/{id}/purge`）：把记录从 `access.json`
+  里彻底移除，用来清理堆积的已吊销密钥。与既有「吊销」（软删、保留 `revoked_at` 审计痕迹）
+  分工明确；走独立 `/purge` 子路径而不改 `DELETE /keys/{id}` 的语义，**老调用方重试仍只会
+  吊销，不会因为一次手滑把密钥删掉**。
+
+**请求日志**
+
+- 默认每页 **50 条**（原为「全部显示」）。`console.html` 的 selected 项、
+  `state.usagePageSize`、`USAGE_PAGE_DEFAULT` 三处同步。
+- 侧栏「请求日志」右侧的红点改为**持久化已读**：进入日志页时把「已读时间戳」写进
+  `localStorage`（`wb2api_nav_errors_seen_at`），刷新/重开浏览器后仍然算已读。
+  红点数按**记录时间**而非累计数计算 —— 日志会轮转、会被清空，拿总数当基线的话清空后
+  红点就再也不出现了。**该时间戳只作用于这一个徽标**，总览与使用分析的统计一律不看它。
+
+**模型列表**
+
+- 新增**供应商**筛选，与既有「产品线」「类型」筛选同一形态，数据源是上游下发的
+  `m.vendor`。空 vendor 的模型不进选项，但仍出现在「全部供应商」下。
+
+**统计口径：499 不再算失败**
+
+- `HTTP 499` 是客户端主动中断（客户端先断开、网关随之取消上游），既不是成功，也不是
+  上游或账号的故障。`usagelog.Totals` 为它单开 `Canceled` 档，恒等式变为
+  `Requests = Success + Failed + Canceled`；前端 `ConsoleMetrics.failed` 同步排除 499。
+- 这么改的理由很具体：把 499 算进失败，会让「失败数」和侧栏红点混入**用户自己按下的
+  取消**，运维照着这个数字去查上游，追的却是一个并不存在的问题。
 
 ### v1.3.0：出站身份对齐官方客户端（修复 11128）
 
