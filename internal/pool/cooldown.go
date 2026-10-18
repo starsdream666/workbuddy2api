@@ -95,31 +95,6 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	}
 }
 
-// CooldownChannelBlocked 上游渠道校验拦截（HTTP 400 + code 11128 "request illegal"）的
-// 冷却入口：把该账号隔离一段时间，让选号跳过它、同会话下一跳自动落到健康号。
-//
-// 与 Cooldown 的唯一差别：**不喂熔断器**（不调 recordBreakerFailureLocked）。
-// 理由：渠道校验的判据落在账号维度（实证见 upstream.ErrChannelBlocked 注释），但上游何时
-// 解除标记不可知 —— 可能几分钟，也可能到次日。Cooldown 的语义是"该号此刻确实不可用 +
-// 累计病情"，30m 起跳的熔断一旦落下，上游已恢复的号仍被硬封；而且 reason 会被熔断状态
-// 盖住，运维看不出"这是 11128 渠道拦截"和"这是真故障"的区别。
-//
-// 保留 softStreak 指数退避：持续被标记 → base、2×base、4×base… 封顶 softRateMax，
-// 避免"每次只冷一个基数、反复被选中反复白打"（线上实测单号 235 次白打即此因）。
-func (p *Pool) CooldownChannelBlocked(uid string, base time.Duration, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.softStreak++
-		d := p.softDurationLocked(base, e.softStreak)
-		e.until = time.Now().Add(d)
-		e.coolKind = CoolSoft
-		e.reason = reason
-		e.softRateModel = "" // 账号级隔离：清掉 6004 的模型豁免痕迹，避免换模型绕过本次冷却
-		p.markDirty()
-	}
-}
-
 // softRateMaxOr 返回生效的 softRateMax（未注入时按默认 2h），供封顶计算。
 // 调用方必须已持有 p.mu。
 func (p *Pool) softRateMaxOr() time.Duration {

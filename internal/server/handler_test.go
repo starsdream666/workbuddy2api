@@ -1552,16 +1552,15 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	}
 }
 
-// TestChannelBlockedCoolsAccountWithoutBreaker 渠道校验拦截（400 + code 11128 +
-// "request illegal"）必须把该号软冷却隔离，但**不喂熔断器**。
+// TestChannelBlockedDoesNotPenalizeAccount 渠道校验拦截（400 + code 11128）**不罚账号**。
 //
-// 线上依据（2026-10-18 自建实例实号对照，同出口 IP / 同头族 / 同 body / 相邻分钟）：
-// 被标记号 13/13 命中 11128，健康号 4/4 直接 200 —— 判定落在**账号维度**，换号能解。
-// 修复前这条路径掉进 ErrClient 的 default 分支（只换号不罚），于是被标记的号永远是
-// "健康"状态、被反复选中反复白打（线上单号 235 次）。
-func TestChannelBlockedCoolsAccountWithoutBreaker(t *testing.T) {
+// 成因是请求缺会话身份三件套，不是账号坏了 —— 2026-10-18 实证：uid=816db6e5 /
+// f4e1d05d 不带 X-Conversation-* 时 2/2 被拦，补上后 3/3 全部 200。
+// 早前一版把这条错误记到账号头上并软冷却隔离，等于把「请求形状不对」误判成
+// 「账号坏了」—— 冷掉的全是好号。这条测试就是那个误判的回归钉。
+func TestChannelBlockedDoesNotPenalizeAccount(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	// 熔断阈值 1：只要误喂一次熔断失败就会落下 BreakerUntil，断言因此足够灵敏。
+	// 熔断阈值 1：任何一次误喂熔断都会立刻落下 BreakerUntil，断言因此足够灵敏。
 	p.SetBreaker(1, time.Hour, time.Hour)
 	h := NewHandler(Config{Pool: p, SoftCooldown: 10 * time.Minute})
 
@@ -1572,20 +1571,15 @@ func TestChannelBlockedCoolsAccountWithoutBreaker(t *testing.T) {
 	if !ok {
 		t.Fatal("status u1 missing")
 	}
-	if !st.Cooling {
-		t.Fatalf("account must be cooled after channel block: %+v", st)
+	if st.Cooling {
+		t.Errorf("channel block must NOT cool the account（成因是请求形状，不是账号）: %+v", st)
 	}
-	if st.Reason != "11128 channel blocked" {
-		t.Errorf("reason=%q want %q（运维要能区分「渠道拦截」与「真故障」）", st.Reason, "11128 channel blocked")
-	}
-	if st.CoolRemaining <= 0 {
-		t.Errorf("cool_remaining_sec=%d want > 0", st.CoolRemaining)
-	}
-	if st.BreakerFails != 0 || !st.BreakerUntil.IsZero() {
-		t.Errorf("breaker must stay untouched: fails=%d until=%v", st.BreakerFails, st.BreakerUntil)
+	if st.ErrTotal != 0 || st.BreakerFails != 0 || !st.BreakerUntil.IsZero() {
+		t.Errorf("channel block must not count as account failure: err_total=%d fails=%d until=%v",
+			st.ErrTotal, st.BreakerFails, st.BreakerUntil)
 	}
 	if st.Disabled {
-		t.Error("channel block must not disable the account（上游可能自己解除标记）")
+		t.Error("channel block must not disable the account")
 	}
 }
 

@@ -1201,14 +1201,20 @@ func (h *Handler) applyErrorPolicyOn(pl *pool.Pool, uid string, kind upstream.Er
 		// 内容策略拦截（误报）：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 模式由 chatCompletions 内降级重试处理；custom 模式本不会到此分支。
 	case upstream.ErrChannelBlocked:
-		// 渠道校验拦截（400 + code 11128 + "request illegal"）：判据落在**账号维度** ——
-		// 同出口 IP / 同头族 / 同 body 的对照实验里，被标记号 13/13 拦、健康号 4/4 过
-		// （见 upstream.ErrChannelBlocked 注释）。与 ErrContentBlocked 处置正好相反：
-		// 这里罚账号**才有用**，因为换到未标记的号就能通过。
-		// 软冷却隔离该号（base = soft_rate，持续命中按 softStreak 指数退避封顶），
-		// 但不喂熔断器 —— 上游可能几分钟到次日自愈，30m 起的硬封会盖住可恢复的号。
-		// 粘性绑定由轮转分支的 fail() 解绑，本会话下一跳自动落到健康号。
-		pl.CooldownChannelBlocked(uid, softCooldown, "11128 channel blocked")
+		// 渠道校验拦截（400 + code 11128）：**不罚账号，只换号**。
+		//
+		// 语义修正（2026-10-18，两次独立实证）：
+		//   - 同类项目 dsh-connect-workbuddy 4.6.3 定案：11128 由「请求缺会话身份三件套」
+		//     触发，账号之间只是**严格度不同**，不存在账号级封禁；
+		//   - 本实例实号对照：uid=816db6e5 / f4e1d05d 不带三件套时 2/2 被拦，
+		//     补上 X-Conversation-* 后 3/3 全部 200 —— 号本身一直是好的。
+		//
+		// 所以这里**不能冷却账号**：早前一版把这条错误记到账号头上、把号逐个隔离，
+		// 等于把「请求形状不对」误判成「账号坏了」，冷掉的全是好号。
+		// 三件套已在 ChatHeaders 补齐（upstream.applyConversationIdentity），正常路径
+		// 不该再走到这里；若仍走到，说明上游又加了新闸 —— 该改的是请求形状，换号只是
+		// 撞严格度差异，罚号纯属误伤。
+		log.Printf("WARN: [server] 11128 channel-blocked uid=%s：请求未通过上游渠道校验（会话身份头可能缺失或被上游加闸），不罚账号；核对 upstream.applyConversationIdentity 是否生效", logfmt.UID8(uid))
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，

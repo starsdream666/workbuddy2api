@@ -212,6 +212,32 @@ func (c *Client) applyAgentIdentity(req *http.Request, a *auth.Auth) {
 	}
 }
 
+
+// applyConversationIdentity 设置官方桌面端的**会话身份三件套**：
+// X-Conversation-ID / X-Conversation-Request-ID / X-Conversation-Message-ID。
+//
+// 依据（两条独立来源 + 本实例实号对照）：
+//   - 官方客户端 bundle 的 applyGatewayHeaders 在每条 chat 上各生成一个 randomUUID；
+//   - 同类项目 dsh-connect-workbuddy 在 4.6.3 把「缺三件套 → 11128」定为根因，
+//     并给出最小必需集：单独一个 X-Conversation-ID 仍然 11128，三个都要。
+//
+// 本实例实测（同一账号、同一 body、同一套其余头，只增删这三行）：
+//
+//	uid=816db6e5 不带 2/2 被拦（400 code 11128 "request illegal"）→ 带 3/3 全部 200
+//	uid=f4e1d05d 不带 2/2 被拦                                → 带 3/3 全部 200
+//
+// 也就是说此前**不是账号被上游标记**，而是请求缺会话身份：上游对缺失的容忍度
+// 按账号不同，同一条请求在两个号上一个 400 一个 200，看起来才像账号级。
+//
+// 三个值上游不校验来源、只做关联，但**不能复用同一个值**（复用等于拿一个 id
+// 冒充三次会话身份）。每次请求新生成，与官方客户端 randomUUID() 的行为一致。
+//
+// 只加在 chat：官方客户端调 billing / refresh 时不带，实测也不影响。
+func (c *Client) applyConversationIdentity(req *http.Request) {
+	req.Header.Set("X-Conversation-ID", newUUIDv4())
+	req.Header.Set("X-Conversation-Request-ID", newUUIDv4())
+	req.Header.Set("X-Conversation-Message-ID", newUUIDv4())
+}
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
 // 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth) {
@@ -243,6 +269,10 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth) {
 	// 缺了会显得像个通用 OpenAI 客户端而不是 WorkBuddy 自己。
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	c.applyAgentIdentity(req, a)
+	// 会话身份三件套 —— 国际网关在「首条必须是 system」之外的第二道闸：
+	// 缺这三个头即 HTTP 400 + code 11128（msg 可能写 "request illegal"，也可能写
+	// "conversation id missing"，displayTips 还会误写成"可能不是官方客户端发出的"）。
+	c.applyConversationIdentity(req)
 }
 
 // BillingHeaders billing 接口请求头。

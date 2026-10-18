@@ -40,13 +40,20 @@ const (
 	// 在请求抵达业务层之前挡下并整页返回。全局性故障，与账号凭证 / 余额 / 限流状态无关，
 	// 不该算到单个账号头上（否则一次边缘抖动会把整池健康账号逐个喂进熔断器）。
 	ErrUpstreamGateway
-	// ErrChannelBlocked 上游渠道校验拦截（HTTP 400 + code 11128 + msg "request illegal"）。
-	// 判据是「这次调用没通过渠道校验 / 该账号已被上游标记」，既不是内容审核，也不是余额或限流。
-	// 实测口径（2026-10-18，自建实例做实号对照，同出口 IP / 同头族 / 同 body / 相邻分钟）：
-	// 被标记的号 13/13 命中 11128，健康号 4/4 直接 200 —— 判定落在**账号维度**，
-	// 换号能解、改 header 不能解（同一批实验里去/留浏览器头两组都是 5/5 被拦）。
-	// 处置：软冷却隔离该号（选号跳过、同会话下一跳自动换健康号），**不喂熔断器** ——
-	// 上游何时解除标记不可知（几分钟 ~ 次日），30m 起跳的硬封会盖住"可自愈"的号。
+	// ErrChannelBlocked 上游渠道校验拦截（HTTP 400 + code 11128）。
+	//
+	// **不是账号问题，是请求形状问题**（2026-10-18 两次独立实证定案）：
+	// 国际网关在「首条必须是 system」之外另有一道**会话身份闸**，chat 请求必须携带
+	// X-Conversation-ID / X-Conversation-Request-ID / X-Conversation-Message-ID。
+	//   - 同类项目 dsh-connect-workbuddy 4.6.3：缺三件套 → 11128，补上即 200；
+	//   - 本实例实号对照：uid=816db6e5 / f4e1d05d 不带三件套 2/2 被拦，补上后 3/3 全 200。
+	//
+	// 早前把这条判成「账号被标记」是错的：那两次实验都精简掉了会话身份头，而上游对
+	// 缺失的**容忍度按账号不同** —— 同一条请求在两个号上一个 400 一个 200，看上去才像
+	// 账号级。判据方向错了一格，处置就差出「隔离好号」和「补一个头」两回事。
+	//
+	// 处置：不罚账号，只换号（形状已在 ChatHeaders 的 applyConversationIdentity 补齐；
+	// 若仍命中，说明上游又加了新闸，该改的仍是请求形状）。
 	ErrChannelBlocked
 )
 
@@ -159,6 +166,9 @@ var contentBlockedMarkers = []string{
 // contentBlockedMarkers 的 "illegal api invocation" 一起吞掉，让内容审核误判成账号问题。
 var channelBlockedMarkers = []string{
 	"request illegal",
+	// 同一道闸的另一种文案：上游有时把「缺会话身份三件套」直说成
+	// "conversation id missing"（dsh-connect-workbuddy #67 的原始报文）。
+	"conversation id missing",
 	"channel verification", // displayTips: "This call failed channel verification ..."
 	"not sent from an official client",
 	"来自官方客户端",  // 中文 displayTips 原文

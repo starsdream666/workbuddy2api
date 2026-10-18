@@ -333,6 +333,12 @@ go run ./cmd/importauth -dry-run   # 只打印将要写入的内容，不落盘
 API 请求（除豁免路径外）必须携带」）、`X-Requested-With: XMLHttpRequest`、同域
 `Origin`/`Referer`；chat 另带 `Accept: application/json, text/event-stream`。
 
+**chat 还必须带会话身份三件套**：`X-Conversation-ID` / `X-Conversation-Request-ID` /
+`X-Conversation-Message-ID` —— 各一个新生成的 UUID v4，**每请求重新生成、三值互不相同**
+（复用等于拿一个 id 冒充三次会话身份，而这三个值正是上游做关联用的）。这是国际网关在
+「首条必须是 system」之外的第二道闸，缺即 `400 code 11128`（详见下节「错误分类与账号处置」）。
+只加在 chat 端点，billing / refresh 不带。
+
 `X-Product` 恒为 `SaaS`（**不是**品牌名 WorkBuddy）：官方两个客户端都这么发，上游按它做
 「使用端」归因，发品牌名会被归到未知客户端。
 
@@ -347,7 +353,7 @@ API 请求（除豁免路径外）必须携带」）、`X-Requested-With: XMLHtt
 ```
 
 注：对齐请求形状只解决「身份/归因/版本闸门」这一层。**被上游标记的账号不会因此解封** ——
-实测同一形状下被标记号仍 13/13 命中 11128，见[错误分类与账号处置](#错误分类与账号处置)。
+注：请求形状对齐分两层 —— 「身份 / 归因 / 版本闸门」（UA / `X-Product` / `X-IDE-*` / agent 头族）与**会话身份闸**（`X-Conversation-ID` 三件套）。后者才是 `11128` 的开关，缺它整类请求都会被拦，见[错误分类与账号处置](#错误分类与账号处置)。
 
 ## 额度冻结（余额为 0 的账号不再空转）
 
@@ -678,12 +684,12 @@ docker compose -f docker-compose.yml -f docker-compose.settings.yml up -d --buil
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
 | 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
-| 渠道校验拦截 | HTTP 400 + code `11128` + `request illegal` / `channel verification` 文案 | 软冷却 `soft_rate` 起，按 `soft_streak` 指数退避；**不喂熔断器、不记错、不禁用**（被标记的是该账号，换号即解） | 到期自动恢复；持续命中则退避逐步拉长，封顶 `soft_rate_max` |
+| 渠道校验拦截 | HTTP 400 + code `11128` + `request illegal` / `conversation id missing` 文案 | **不罚账号**，只换号（成因是请求缺会话身份三件套，不是账号问题） | 即时（补齐 `X-Conversation-*` 后不再出现） |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
 请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。请求体的网关侧截断已由 `server.max_body_mb` 的 413 消灭，剩余的 `11101` 只可能是客户端发来的畸形 JSON。
 
-**渠道校验拦截**（`11128 request illegal`）与内容拦截共用业务码 `11128`，但判据完全不同：内容拦截是**请求内容**触雷（换号没有意义），渠道校验是**该账号**被上游标记（换到未标记的号就能过）。实测口径（自建实例，同出口 IP / 同头族 / 同 body / 相邻分钟）：被标记号 13/13 命中 11128，健康号 4/4 直接 200；同一秒里多个不同账号一起被拦，说明拦截以「这次调用 + 这个账号」为单位，而不是单看请求形状（去掉浏览器头与否两组都是 5/5 被拦）。故处置是给该号**软冷却隔离**（选号跳过、粘性解绑、下一跳自动换健康号），但**不喂熔断器**——上游解除标记的时间不可知（几分钟 ~ 次日），30m 起跳的硬封会盖住本可自愈的号。全池都撞到时的出口错误码是 `upstream_channel_blocked`，不再复述成 `no_healthy_account`（`all accounts unavailable (cooling/disabled)`），避免把「号被上游标记」误报成「号都被冷却了」。
+**渠道校验拦截**（`11128`，msg 可能是 `request illegal`，也可能是 `conversation id missing`）与内容拦截共用业务码，但成因**不在账号**：国际网关在「首条必须是 system」之外另有一道**会话身份闸** —— chat 请求必须携带 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID` 三件套（官方客户端每次各生成一个 `randomUUID`），缺即 `11128`。上游对缺失的**容忍度按账号不同**，所以同一条请求会在两个号上一个 400 一个 200 —— 看上去像账号被封，实际是同一个请求形状问题（同类项目 dsh-connect-workbuddy 的 #67 + 4.6.3 定案，本实例独立复现）。实测（同一账号、同一 body，只增删这三头）：`uid=816db6e5` 与 `f4e1d05d` 不带时 2/2 被拦，补上后 **3/3 全部 200**。故处置是**不罚账号、只换号**；三件套已在 `ChatHeaders` 补齐（`upstream.applyConversationIdentity`）。全池都撞到时的出口错误码是 `upstream_channel_blocked`，不再复述成 `no_healthy_account`（`all accounts unavailable (cooling/disabled)`）。
 
 **熔断器**：所有冷却入口与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
