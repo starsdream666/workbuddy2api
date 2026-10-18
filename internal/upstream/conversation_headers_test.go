@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/realm"
 )
 
 // uuidV4Re 标准 UUID v4 形态（版本位 4、变体位 8/9/a/b）。
@@ -112,5 +113,73 @@ func TestNewUUIDv4ShapeAndUniqueness(t *testing.T) {
 			t.Fatalf("newUUIDv4() 生成重复值 %q", v)
 		}
 		got[v] = true
+	}
+}
+
+// TestRequestIDMatchesMessageID 官方客户端把 X-Request-ID 发成与
+// X-Conversation-Message-ID **同一个值**（application-manifest.js 逆向原文：
+// 「the message and request ids are the same one, as WorkBuddy's client has them」）。
+// 我们此前完全没发 X-Request-ID，是「少了」的那一项。
+func TestRequestIDMatchesMessageID(t *testing.T) {
+	c := New()
+	a := &auth.Auth{UID: "u1", AccessToken: "at1"}
+	req := httptest.NewRequest("POST", "https://example.invalid/v2/chat/completions", nil)
+	c.ChatHeaders(req, a)
+
+	reqID := req.Header.Get("X-Request-ID")
+	msgID := req.Header.Get("X-Conversation-Message-ID")
+	if reqID == "" {
+		t.Fatal("chat 缺 X-Request-ID（官方客户端必发，且与 Message-ID 同值）")
+	}
+	if reqID != msgID {
+		t.Errorf("X-Request-ID=%q 应等于 X-Conversation-Message-ID=%q", reqID, msgID)
+	}
+}
+
+// TestXNoHeadersOnlyForCLIFingerprint X-No-* 是 CLI 的「缺省字段声明」约定；
+// 官方桌面端在凭据缺失时**什么都不发**（application-manifest.js：
+// 「A personal account has none and sends none」）。此前两条线共用一套 X-No-*，
+// 桌面指纹因此多发了官方客户端从不发的头。
+func TestXNoHeadersOnlyForCLIFingerprint(t *testing.T) {
+	// 故意不带 EnterpriseID / Domain，触发「缺省字段」分支。
+	a := &auth.Auth{UID: "u1", AccessToken: "at1"}
+
+	cli := New()
+	cli.RealmDefault = realm.CN
+	reqCLI := httptest.NewRequest("POST", "https://example.invalid/v2/chat/completions", nil)
+	cli.ChatHeaders(reqCLI, a)
+	if got := reqCLI.Header.Get("X-No-Enterprise-Id"); got != "1" {
+		t.Errorf("CLI 指纹应发 X-No-Enterprise-Id=1（缺省字段声明），got %q", got)
+	}
+
+	desk := New()
+	desk.RealmDefault = realm.CN
+	desk.RealmFingerprints = map[string]realm.Fingerprint{realm.CN: realm.FingerprintDesktop}
+	reqDesk := httptest.NewRequest("POST", "https://example.invalid/v2/chat/completions", nil)
+	desk.ChatHeaders(reqDesk, a)
+	for _, k := range []string{"X-No-Enterprise-Id", "X-No-Department-Info", "X-No-User-Id", "X-No-Authorization"} {
+		if v := reqDesk.Header.Get(k); v != "" {
+			t.Errorf("桌面指纹不该发 %s=%q（官方桌面端个人号不发任何 X-No-*）", k, v)
+		}
+	}
+}
+
+// TestEnterpriseAccountSendsBothIDHeaders 企业号：官方同时发 X-Enterprise-Id
+// 与 X-Tenant-Id（同值，application-manifest.js 的 auth interceptor）。
+// 此前只发了前者 —— 这是「少了」的另一项。
+func TestEnterpriseAccountSendsBothIDHeaders(t *testing.T) {
+	c := New()
+	a := &auth.Auth{UID: "u1", AccessToken: "at1", EnterpriseID: "e1"}
+	req := httptest.NewRequest("POST", "https://example.invalid/v2/chat/completions", nil)
+	c.ChatHeaders(req, a)
+
+	if got := req.Header.Get("X-Enterprise-Id"); got != "e1" {
+		t.Errorf("X-Enterprise-Id=%q want e1", got)
+	}
+	if got := req.Header.Get("X-Tenant-Id"); got != "e1" {
+		t.Errorf("X-Tenant-Id=%q want e1（官方两个都发且同值）", got)
+	}
+	if got := req.Header.Get("X-No-Enterprise-Id"); got != "" {
+		t.Errorf("企业号不该发 X-No-Enterprise-Id，got %q", got)
 	}
 }

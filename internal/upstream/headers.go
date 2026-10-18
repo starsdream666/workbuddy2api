@@ -234,44 +234,66 @@ func (c *Client) applyAgentIdentity(req *http.Request, a *auth.Auth) {
 //
 // 只加在 chat：官方客户端调 billing / refresh 时不带，实测也不影响。
 func (c *Client) applyConversationIdentity(req *http.Request) {
+	// 官方客户端的 id 关系（application-manifest.js / magpie-auth 逆向）：
+	//   X-Conversation-ID          会话级
+	//   X-Conversation-Request-ID  轮次级（一次用户发送）
+	//   X-Conversation-Message-ID  消息级（每请求一个新值）
+	//   X-Request-ID               **与 Message-ID 同值**（官方就是这么发的）
+	// 上游不校验这三个值的来源，只拿它们做关联；我们每个 HTTP 请求就是一次发送，
+	// 因此三级都取新 UUID 即可（Conversation-ID 的会话级稳定性不影响能否通过）。
+	msgID := newUUIDv4()
 	req.Header.Set("X-Conversation-ID", newUUIDv4())
 	req.Header.Set("X-Conversation-Request-ID", newUUIDv4())
-	req.Header.Set("X-Conversation-Message-ID", newUUIDv4())
+	req.Header.Set("X-Conversation-Message-ID", msgID)
+	req.Header.Set("X-Request-ID", msgID)
 }
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
-// 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
+//
+// 头集合按**指纹分两套**，因为官方两个客户端本来就不一样：
+//   - CLI：缺省字段用 X-No-* 声明（X-No-Authorization / X-No-User-Id / …），这是
+//     CodeBuddy CLI 的约定；
+//   - 桌面端：官方 application-manifest.js 在个人号上**什么都不发**
+//     （「A personal account has none and sends none」），所以桌面指纹下不发任何 X-No-*。
+//     此前两条线共用一套 X-No-*，桌面端就多发了官方的客户端从不发的头。
+//
+// 企业号：两个客户端都发 X-Enterprise-Id **和** X-Tenant-Id（同值）——此前只发了前者。
+//
+// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token（该头只允许出现在 refresh 端点）。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth) {
 	a = a.Snapshot()
 	c.CommonHeaders(req, a)
+
+	// X-No-* 是 CLI 的缺省字段约定；桌面端官方客户端在凭据缺失时不发任何声明头。
+	cliStyle := c.fingerprintOf(a) != realm.FingerprintDesktop
+
 	if a.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	} else {
+	} else if cliStyle {
 		req.Header.Set("X-No-Authorization", "1")
 	}
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
-	} else {
+	} else if cliStyle {
 		req.Header.Set("X-No-User-Id", "1")
 	}
 	if a.EnterpriseID != "" {
+		// 企业号：官方同时发 X-Enterprise-Id 与 X-Tenant-Id（同值，auth interceptor）。
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-	} else {
+		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	} else if cliStyle {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
-	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
 	if a.Domain != "" {
 		req.Header.Set("X-Domain", a.Domain)
-	} else {
+	} else if cliStyle {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	c.applyClientIdentity(req, a)
-	// chat 的 Accept 按官方声明：官方 chat 请求带 text/event-stream（不是 */*），
-	// 缺了会显得像个通用 OpenAI 客户端而不是 WorkBuddy 自己。
+	// chat 的 Accept 按官方声明取 text/event-stream。实测去掉它上游照样 200 ——
+	// 它不是校验判据，只是形状对齐（真正必需的是非空 User-Agent 与三件套）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	c.applyAgentIdentity(req, a)
-	// 会话身份三件套 —— 国际网关在「首条必须是 system」之外的第二道闸：
-	// 缺这三个头即 HTTP 400 + code 11128（msg 可能写 "request illegal"，也可能写
-	// "conversation id missing"，displayTips 还会误写成"可能不是官方客户端发出的"）。
+	// 会话身份三件套 —— 国际网关在「首条必须是 system」之外的第二道闸。
 	c.applyConversationIdentity(req)
 }
 
