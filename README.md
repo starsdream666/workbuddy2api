@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v1.1.0-119c76?style=flat-square">
+<img alt="Version" src="https://img.shields.io/badge/version-v1.3.0-119c76?style=flat-square">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Docker_Compose-2496ED?logo=docker&logoColor=white&style=flat-square">
@@ -34,6 +34,27 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 CodeBuddy 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
 ## 核心能力
+
+### v1.3.0：出站身份对齐官方客户端（修复 11128）
+
+上游国际网关在「首条消息必须是 system」之外另加了一道**会话身份闸**：chat 请求必须携带
+`X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`，缺即
+`400 code 11128`。本项目此前一个都不发，导致部分账号**每个请求都失败**；而失败在账号之间
+表现不一致（上游对缺失的容忍度按账号不同），一度被误读成「账号被上游封禁」。
+
+本版把出站 chat 头集合逐条对齐官方桌面客户端（`application-manifest.js`）与官方 CLI
+（`@tencent-ai/codebuddy-code` 2.168.2）：补三件套与 `X-Request-ID`、`X-Product` 改为
+`SaaS`、补 agent 头族、企业号补 `X-Tenant-Id`、桌面指纹不再发 `X-No-*`；UA 升到
+`WorkBuddy/5.5.6` 与 `CLI/2.168.2 CodeBuddy/2.168.2`。实测同一账号补头后由 2/2 被拦转为
+**3/3 全通**，线上 11128 归零。
+
+同时 `11128` 不再被当作账号故障：新增的 `upstream_channel_blocked` 错误码如实说明「这是请求
+形状问题，不是账号坏了」，该错误**不罚账号**（不冷却、不熔断、不禁用）。
+
+> 减法实测顺带定案了这一层的判据：真正必需的只有「非空 `User-Agent` + 会话身份三件套」。
+> 去掉 `X-Agent-*` / `X-IDE-*` / `X-Product` / `X-CodeBuddy-Request` / `Accept` /
+> `Origin`+`Referer` 都仍返回 200；去掉 `User-Agent` 则 2/2 被拦，而把 UA 换成任意字符串
+> 又能通过。其余头是「像不像官方」的形状，不是校验依据。
 
 ### v1.1.0：控制台主题
 
